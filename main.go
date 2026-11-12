@@ -1076,7 +1076,54 @@ func wrapICO(pngData []byte, w, h int) []byte {
 const (
 	autostartValueName = "AiTalk"
 	autostartRunKey    = `Software\Microsoft\Windows\CurrentVersion\Run`
+
+	settingsKey      = `Software\ai-talk` // настройки из меню трея (HKCU)
+	showMessagesName = "ShowMessages"
 )
+
+// settings — флажки из меню трея, которые переживают перезапуск: DWORD-значения
+// в HKCU\key (в программе — settingsKey, в тестах — временный ключ).
+type settings struct {
+	key string
+}
+
+// Bool возвращает значение name; def — если его ещё нет или его не прочитать.
+func (s settings) Bool(name string, def bool) bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, s.key, registry.QUERY_VALUE)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("settings: открытие ключа: %v", err)
+		}
+		return def
+	}
+	defer logRegistryClose(key, s.key)
+	v, _, err := key.GetIntegerValue(name)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			log.Printf("settings: чтение %s: %v", name, err)
+		}
+		return def
+	}
+	return v != 0
+}
+
+// SetBool сохраняет значение name, создавая ключ при необходимости.
+func (s settings) SetBool(name string, v bool) (err error) {
+	key, _, err := registry.CreateKey(registry.CURRENT_USER, s.key, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := key.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("закрытие ключа %s: %w", s.key, cerr))
+		}
+	}()
+	var dw uint32
+	if v {
+		dw = 1
+	}
+	return key.SetDWordValue(name, dw)
+}
 
 // autostart — автозапуск программы через значение autostartValueName в
 // ключе HKCU\key (в программе — autostartRunKey, в тестах — временный ключ).
@@ -1230,6 +1277,10 @@ type trayApp struct {
 	debug bool
 	agent *agent
 
+	// showMessages — показывать ли входящие сообщения уведомлением; читается
+	// из горутины соединения, меняется из меню.
+	showMessages atomic.Bool
+
 	mState  *systray.MenuItem
 	mToggle *systray.MenuItem
 }
@@ -1255,6 +1306,7 @@ func (a *trayApp) onReady() {
 		a.mToggle.SetTooltip("Не настроено: задайте AGENT_LISTEN или AGENT_CONNECT, и AGENT_TOKEN в .env")
 	}
 	go a.watchToggle()
+	a.addShowMessagesItem(settings{key: settingsKey})
 
 	systray.AddSeparator()
 	a.addAutostartItem(autostart{key: autostartRunKey})
@@ -1323,8 +1375,39 @@ func (a *trayApp) onStateChange(s connState, peer string) {
 	}
 }
 
-// onMessage показывает входящее сообщение всплывающим уведомлением.
+// addShowMessagesItem добавляет пункт с галочкой, включающий/выключающий
+// уведомления о входящих сообщениях. Сами сообщения по-прежнему попадают во
+// входящие API — выключается только показ.
+func (a *trayApp) addShowMessagesItem(s settings) {
+	a.showMessages.Store(s.Bool(showMessagesName, true))
+	item := systray.AddMenuItemCheckbox(
+		"Показывать входящие сообщения",
+		"Всплывающее уведомление на каждое сообщение со второго компьютера",
+		a.showMessages.Load(),
+	)
+	go func() {
+		for range item.ClickedCh {
+			show := !item.Checked()
+			if err := s.SetBool(showMessagesName, show); err != nil {
+				log.Printf("settings: не удалось сохранить %s: %v", showMessagesName, err)
+			}
+			a.showMessages.Store(show)
+			if show {
+				item.Check()
+			} else {
+				item.Uncheck()
+			}
+			log.Printf("tray: показ сообщений=%v", show)
+		}
+	}()
+}
+
+// onMessage показывает входящее сообщение всплывающим уведомлением, если
+// показ включён в трее.
 func (a *trayApp) onMessage(m message) {
+	if !a.showMessages.Load() {
+		return
+	}
 	text := m.Text
 	if r := []rune(text); len(r) > 200 {
 		text = string(r[:200]) + "…"

@@ -15,6 +15,7 @@
 - Значок в трее и всплывающее уведомление отражают состояние: отключено, ожидание подключения, подключено (с именем собеседника).
 - При включении клиент сам переподключается каждые несколько секунд, пока связь не настроена; при разрыве уже установленного соединения — тоже.
 - Сервер принимает только одно соединение за раз — второе отклоняется, пока первое не закроется.
+- Пункт меню «Показывать входящие сообщения» (с галочкой, по умолчанию включён) включает/выключает всплывающие уведомления о сообщениях. Сообщения при этом всё равно попадают во входящие API. Выбор сохраняется в `HKCU\Software\ai-talk`.
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Необязательный файл `.env` для конфигурации; если его нет — переменные окружения, затем флаги.
 - Соединение включается автоматически при старте программы, если конфигурация задана.
@@ -112,6 +113,7 @@ The protocol and networking code come from [lanagent](https://github.com/des1roe
 - The tray icon and a balloon notification reflect the state: off, waiting for a connection, connected (with the peer's name).
 - When enabled, the client keeps reconnecting every few seconds until the link is up; the same happens after an established connection drops.
 - The server accepts only one connection at a time — a second one is rejected until the first closes.
+- The "Показывать входящие сообщения" ("Show incoming messages") menu item, with a checkmark (on by default), turns message balloon notifications on and off; messages still reach the API inbox. The choice is saved in `HKCU\Software\ai-talk`.
 - The "Запускать при входе в Windows" ("Run at Windows sign-in") menu item, with a checkmark, enables/disables autostart via `HKCU\...\Run`.
 - An optional `.env` file for configuration; falls back to environment variables, then flags.
 - The connection is turned on automatically at startup if configured.

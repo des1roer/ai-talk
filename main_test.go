@@ -743,6 +743,30 @@ func TestAutostart(t *testing.T) {
 	}
 }
 
+func TestSettings(t *testing.T) {
+	s := settings{key: tempRegistryKey(t)}
+	if !s.Bool(showMessagesName, true) || s.Bool(showMessagesName, false) {
+		t.Error("нет значения: должно вернуться умолчание")
+	}
+	if err := s.SetBool(showMessagesName, false); err != nil {
+		t.Fatal(err)
+	}
+	if s.Bool(showMessagesName, true) {
+		t.Error("после SetBool(false) значение true")
+	}
+	if err := s.SetBool(showMessagesName, true); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Bool(showMessagesName, false) {
+		t.Error("после SetBool(true) значение false")
+	}
+
+	missing := settings{key: `Software\ai_talk_test_no_such_key`}
+	if !missing.Bool(showMessagesName, true) {
+		t.Error("нет ключа: должно вернуться умолчание")
+	}
+}
+
 func TestAutostartMissingKey(t *testing.T) {
 	run := autostart{key: `Software\ai_talk_test_no_such_key`}
 	if run.Enabled() {
