@@ -1,0 +1,6 @@
+*.exe
+*.exe~
+*.log
+*.token
+.env
+.idea/
