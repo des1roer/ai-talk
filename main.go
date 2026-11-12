@@ -10,9 +10,11 @@
 //	AGENT_CONNECT=ws://WIN-O3VIUQGMCM8:8080/ws  подключаться к другому компьютеру
 //	AGENT_TOKEN=...                             общий секрет
 //
-// Самого обмена сообщениями программа не ведёт — только включает и
-// выключает сам факт связи; значок в трее и всплывающие уведомления
-// показывают текущее состояние (отключено / ожидание / подключено).
+// Пункт меню в трее включает и выключает соединение; значок и всплывающие
+// уведомления показывают состояние (отключено / ожидание / подключено) и
+// входящие сообщения. Отправлять и читать сообщения можно через локальный
+// API на 127.0.0.1 (см. apiHandler) — им пользуется скилл Claude, чтобы
+// переписываться с Claude на другом компьютере, пока соединение включено.
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,10 +31,12 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +59,12 @@ const (
 	dialTimeout    = 10 * time.Second
 	dialRetryDelay = 3 * time.Second // пауза между неудачными попытками подключиться
 	reconnectDelay = time.Second     // пауза перед повторным подключением после разрыва
+
+	defaultAPIPort = "8767"           // локальный API: 127.0.0.1:AGENT_API_PORT
+	apiHeader      = "X-AI-Talk"      // обязательный заголовок запросов к API
+	maxMessageSize = 1 << 20          // предел одного сообщения (у websocket по умолчанию 32 КБ)
+	maxWait        = 15 * time.Minute // предел ожидания в /inbox?wait=
+	inboxCap       = 500              // сколько последних входящих хранить
 )
 
 // version — версия программы; релизная сборка подставляет её из тега через
@@ -276,6 +287,7 @@ type config struct {
 	listenAddr string // AGENT_LISTEN, например :8080
 	connectURL string // AGENT_CONNECT, например ws://WIN-O3VIUQGMCM8:8080/ws
 	token      string
+	apiAddr    string // 127.0.0.1:AGENT_API_PORT — локальный API для скилла
 }
 
 // resolveConfig собирает настройки по приоритету: флаги, затем окружение (к
@@ -293,6 +305,14 @@ func resolveConfig(debug bool, listenFlag, connectFlag, tokenFlag string) config
 		cfg.connectURL = connectFlag
 	}
 	cfg.token = resolveToken(tokenFlag)
+	port := os.Getenv("AGENT_API_PORT")
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		if port != "" {
+			log.Printf("config: AGENT_API_PORT=%q не порт, беру %s", port, defaultAPIPort)
+		}
+		port = defaultAPIPort
+	}
+	cfg.apiAddr = net.JoinHostPort("127.0.0.1", port)
 
 	switch {
 	case cfg.listenAddr != "" && cfg.connectURL != "":
@@ -353,37 +373,52 @@ const (
 	stateConnected
 )
 
+func (s connState) String() string {
+	switch s {
+	case stateWaiting:
+		return "waiting"
+	case stateConnected:
+		return "connected"
+	default:
+		return "off"
+	}
+}
+
+// errNotConnected — Send, когда соединение ещё не установлено.
+var errNotConnected = errors.New("собеседник не подключён")
+
 // ---------------------------------------------------------------------------
-// agent — включение/выключение соединения между компьютерами
+// agent — соединение между компьютерами и обмен сообщениями
 //
-// agent оборачивает серверную и клиентскую стороны протокола lanagent
-// (WebSocket, токен в Authorization, X-Agent-Host) в единое «включено —
-// выключено»: Start запускает сервер (accept) или клиент (dial-retry) в
-// зависимости от cfg.mode, не блокируя вызывающего; Stop его останавливает.
-// Сам обмен сообщениями не нужен — только факт связи, поэтому вместо чтения
-// stdin/печати в stdout соединение просто держится открытым (holdConnection)
-// до разрыва или отмены контекста.
+// Протокол — как у lanagent: WebSocket, токен в Authorization, имя компьютера
+// в X-Agent-Host, текстовые кадры; на "ping" сторона сама отвечает
+// "pong от <имя>". Start запускает сервер (accept) или клиент (dial с
+// повторами) по cfg.mode, Stop останавливает. Входящие сообщения
+// складываются в inbox, откуда их забирает локальный API (apiHandler).
 // ---------------------------------------------------------------------------
 
 type agent struct {
-	cfg config
+	cfg   config
+	inbox *inbox
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{}
 	state  connState
 	peer   string
+	conn   *websocket.Conn // установленное соединение, nil — нет
 
-	// onState вызывается при каждом изменении состояния; используется треем
-	// для обновления значка/подсказки и показа уведомлений.
-	onState func(state connState, peer string)
+	// onState вызывается при каждом изменении состояния, onMessage — на
+	// каждое входящее сообщение (кроме ping). Задаются до Start.
+	onState   func(state connState, peer string)
+	onMessage func(m message)
 }
 
 func newAgent(cfg config, onState func(connState, string)) *agent {
-	return &agent{cfg: cfg, onState: onState}
+	return &agent{cfg: cfg, inbox: newInbox(inboxCap), onState: onState}
 }
 
-// Running сообщает, запущено ли сейчас соединение (не то же самое, что
+// Running сообщает, включено ли соединение в трее (не то же самое, что
 // «подключено прямо сейчас» — см. State).
 func (a *agent) Running() bool {
 	a.mu.Lock()
@@ -391,7 +426,7 @@ func (a *agent) Running() bool {
 	return a.cancel != nil
 }
 
-// State возвращает текущее состояние и, если есть, адрес/имя собеседника.
+// State возвращает текущее состояние и, если есть, имя собеседника.
 func (a *agent) State() (connState, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -426,7 +461,7 @@ func (a *agent) Start() error {
 			a.runClient(ctx)
 		}
 		if ctx.Err() == nil {
-			// Завершилось само по себе (например, порт занят), а не через Stop().
+			// Завершилось само (например, порт занят), а не через Stop().
 			a.mu.Lock()
 			a.cancel = nil
 			a.done = nil
@@ -463,6 +498,19 @@ func (a *agent) setState(s connState, peer string) {
 	}
 }
 
+// Send отправляет текст собеседнику по установленному соединению.
+func (a *agent) Send(ctx context.Context, text string) error {
+	a.mu.Lock()
+	c := a.conn
+	a.mu.Unlock()
+	if c == nil {
+		return errNotConnected
+	}
+	wctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	return c.Write(wctx, websocket.MessageText, []byte(text))
+}
+
 // runServer слушает cfg.listenAddr и принимает одно соединение за раз;
 // второе одновременное подключение отклоняется. Останавливается, когда
 // отменят ctx, закрывая HTTP-сервер и текущее соединение (если есть).
@@ -473,6 +521,7 @@ func (a *agent) runServer(ctx context.Context) {
 	go func() {
 		select {
 		case <-ctx.Done():
+			// http.Server.Shutdown не закрывает upgrade'нутые соединения.
 			if c := active.Load(); c != nil {
 				c.CloseNow()
 			}
@@ -488,6 +537,7 @@ func (a *agent) runServer(ctx context.Context) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		w.Header().Set("X-Agent-Host", host)
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -507,9 +557,7 @@ func (a *agent) runServer(ctx context.Context) {
 		defer active.CompareAndSwap(c, nil)
 
 		log.Printf("agent: соединение: %s", peer)
-		a.setState(stateConnected, peer)
-		holdConnection(ctx, c)
-		c.CloseNow()
+		a.session(ctx, c, peer)
 		log.Printf("agent: соединение закрыто: %s", peer)
 		if ctx.Err() == nil {
 			a.setState(stateWaiting, "")
@@ -545,7 +593,7 @@ func (a *agent) runClient(ctx context.Context) {
 		}
 
 		dctx, cancel := context.WithTimeout(ctx, dialTimeout)
-		c, _, err := websocket.Dial(dctx, a.cfg.connectURL, &websocket.DialOptions{
+		c, resp, err := websocket.Dial(dctx, a.cfg.connectURL, &websocket.DialOptions{
 			HTTPHeader: http.Header{
 				"Authorization": {"Bearer " + a.cfg.token},
 				"X-Agent-Host":  {host},
@@ -562,10 +610,13 @@ func (a *agent) runClient(ctx context.Context) {
 			continue
 		}
 
-		log.Printf("agent: подключено к %s", a.cfg.connectURL)
-		a.setState(stateConnected, a.cfg.connectURL)
-		holdConnection(ctx, c)
-		c.CloseNow()
+		// Сервер ai-talk называет себя в X-Agent-Host ответа; lanagent — нет.
+		peer := resp.Header.Get("X-Agent-Host")
+		if peer == "" {
+			peer = a.cfg.connectURL
+		}
+		log.Printf("agent: подключено к %s (%s)", a.cfg.connectURL, peer)
+		a.session(ctx, c, peer)
 		log.Printf("agent: соединение потеряно")
 		if ctx.Err() != nil {
 			return
@@ -579,14 +630,27 @@ func (a *agent) runClient(ctx context.Context) {
 	}
 }
 
-// holdConnection держит соединение открытым, пока его не закроет собеседник
-// или не отменят ctx: раз в pingInterval шлёт ping, чтобы быстрее заметить
-// обрыв (например, ноутбук уснул), и читает входящие кадры, отбрасывая их —
-// демону-переключателю соединения нужен только сам факт связи, а не
-// содержимое сообщений.
-func holdConnection(ctx context.Context, c *websocket.Conn) {
+// session обслуживает установленное соединение, пока его не закроет
+// собеседник или не отменят ctx: раз в pingInterval шлёт протокольный ping,
+// чтобы заметить обрыв (например, ноутбук уснул), отвечает на "ping" и
+// складывает остальные входящие сообщения в inbox.
+func (a *agent) session(ctx context.Context, c *websocket.Conn, peer string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer c.CloseNow()
+	c.SetReadLimit(maxMessageSize)
+
+	a.mu.Lock()
+	a.conn = c
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		if a.conn == c {
+			a.conn = nil
+		}
+		a.mu.Unlock()
+	}()
+	a.setState(stateConnected, peer)
 
 	go func() {
 		t := time.NewTicker(pingInterval)
@@ -608,10 +672,233 @@ func holdConnection(ctx context.Context, c *websocket.Conn) {
 	}()
 
 	for {
-		if _, _, err := c.Read(ctx); err != nil {
+		_, data, err := c.Read(ctx)
+		if err != nil {
 			return
 		}
+		text := string(data)
+		if strings.EqualFold(strings.TrimSpace(text), "ping") {
+			wctx, wcancel := context.WithTimeout(ctx, dialTimeout)
+			err := c.Write(wctx, websocket.MessageText, []byte("pong от "+host))
+			wcancel()
+			if err != nil {
+				return
+			}
+			continue
+		}
+		m := a.inbox.add(peer, text)
+		log.Printf("agent: сообщение #%d от %s (%d байт)", m.ID, peer, len(data))
+		if a.onMessage != nil {
+			a.onMessage(m)
+		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// inbox — входящие сообщения для локального API
+// ---------------------------------------------------------------------------
+
+type message struct {
+	ID   int       `json:"id"`
+	Time time.Time `json:"time"`
+	From string    `json:"from"`
+	Text string    `json:"text"`
+}
+
+// inbox хранит последние capacity входящих сообщений с возрастающими ID и
+// позволяет дождаться новых (wait). Пропадает при перезапуске программы.
+type inbox struct {
+	mu       sync.Mutex
+	capacity int
+	msgs     []message
+	lastID   int
+	changed  chan struct{} // закрывается и заменяется при каждом add
+}
+
+func newInbox(capacity int) *inbox {
+	return &inbox{capacity: capacity, changed: make(chan struct{})}
+}
+
+func (b *inbox) add(from, text string) message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastID++
+	m := message{ID: b.lastID, Time: time.Now(), From: from, Text: text}
+	b.msgs = append(b.msgs, m)
+	if len(b.msgs) > b.capacity {
+		b.msgs = slices.Delete(b.msgs, 0, len(b.msgs)-b.capacity)
+	}
+	close(b.changed)
+	b.changed = make(chan struct{})
+	return m
+}
+
+// after возвращает сообщения с ID больше id, последний выданный ID и канал,
+// который закроется при следующем add.
+func (b *inbox) after(id int) ([]message, int, <-chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []message
+	if i := slices.IndexFunc(b.msgs, func(m message) bool { return m.ID > id }); i >= 0 {
+		out = slices.Clone(b.msgs[i:])
+	}
+	return out, b.lastID, b.changed
+}
+
+// wait ждёт, пока появятся сообщения с ID больше id, или до отмены ctx.
+func (b *inbox) wait(ctx context.Context, id int) ([]message, int) {
+	for {
+		msgs, last, changed := b.after(id)
+		if len(msgs) > 0 || ctx.Err() != nil {
+			return msgs, last
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Локальный API (только 127.0.0.1) — им пользуется скилл Claude
+//
+//	GET  /status                   состояние соединения
+//	POST /send   (тело — текст)    отправить собеседнику
+//	GET  /inbox?after=N&wait=60    входящие с ID > N; wait — ждать новых
+//
+// Каждый запрос должен нести заголовок X-AI-Talk: 1, а Host — указывать на
+// loopback. Это защита от страниц в браузере: кросс-доменный fetch не может
+// поставить свой заголовок без CORS preflight (на который API не отвечает), а
+// проверка Host отсекает DNS rebinding. Иначе любой сайт мог бы отправить
+// второму Claude текст от имени пользователя.
+// ---------------------------------------------------------------------------
+
+func (a *agent) apiHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		state, peer := a.State()
+		_, last, _ := a.inbox.after(0)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"host":    host,
+			"mode":    a.cfg.mode,
+			"enabled": a.Running(),
+			"state":   state.String(),
+			"peer":    peer,
+			"last_id": last,
+		})
+	})
+	mux.HandleFunc("POST /send", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxMessageSize))
+		if err != nil {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": err.Error()})
+			return
+		}
+		text := strings.TrimSpace(string(body))
+		if text == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "пустое сообщение"})
+			return
+		}
+		if !a.Running() {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "соединение выключено в трее ai-talk"})
+			return
+		}
+		if err := a.Send(r.Context(), text); err != nil {
+			status := http.StatusBadGateway
+			if errors.Is(err, errNotConnected) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		_, peer := a.State()
+		log.Printf("api: отправлено %s (%d байт)", peer, len(text))
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": peer})
+	})
+	mux.HandleFunc("GET /inbox", func(w http.ResponseWriter, r *http.Request) {
+		after := 0
+		if v := r.URL.Query().Get("after"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "after: " + err.Error()})
+				return
+			}
+			after = n
+		}
+		var wait time.Duration
+		if v := r.URL.Query().Get("wait"); v != "" {
+			d, err := parseWait(v)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "wait: " + err.Error()})
+				return
+			}
+			wait = d
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), wait)
+		defer cancel()
+		msgs, last := a.inbox.wait(ctx, after)
+		if msgs == nil {
+			msgs = []message{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"messages": msgs, "last_id": last})
+	})
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(apiHeader) != "1" || !loopbackHost(r.Host) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// parseWait разбирает wait как duration ("90s", "5m") или число секунд и
+// ограничивает его maxWait.
+func parseWait(v string) (time.Duration, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		n, nerr := strconv.Atoi(v)
+		if nerr != nil {
+			return 0, err
+		}
+		d = time.Duration(n) * time.Second
+	}
+	if d < 0 {
+		return 0, errors.New("отрицательное время")
+	}
+	return min(d, maxWait), nil
+}
+
+func loopbackHost(hostport string) bool {
+	h := hostport
+	if hh, _, err := net.SplitHostPort(hostport); err == nil {
+		h = hh
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		log.Printf("api: запись ответа: %v", err)
+	}
+}
+
+// serveAPI слушает локальный API на addr. Блокируется.
+func serveAPI(addr string, h http.Handler) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	log.Printf("api: слушает http://%s", ln.Addr())
+	return (&http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}).Serve(ln)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,11 +1208,17 @@ func main() {
 		loadDotEnv(path)
 	}
 	cfg := resolveConfig(*debug, *listenFlag, *connectFlag, *tokenFlag)
-	log.Printf("config: mode=%q listen=%q connect=%q настроено=%v debug=%v",
-		cfg.mode, cfg.listenAddr, cfg.connectURL, cfg.configured(), cfg.debug)
+	log.Printf("config: mode=%q listen=%q connect=%q api=%s настроено=%v debug=%v",
+		cfg.mode, cfg.listenAddr, cfg.connectURL, cfg.apiAddr, cfg.configured(), cfg.debug)
 
 	tray := &trayApp{debug: cfg.debug}
 	tray.agent = newAgent(cfg, tray.onStateChange)
+	tray.agent.onMessage = tray.onMessage
+	go func() {
+		if err := serveAPI(cfg.apiAddr, tray.agent.apiHandler()); err != nil {
+			log.Printf("api: %v — скилл Claude работать не будет", err)
+		}
+	}()
 
 	systray.Run(tray.onReady, tray.onExit)
 }
@@ -1028,6 +1321,15 @@ func (a *trayApp) onStateChange(s connState, peer string) {
 		systray.SetTooltip("AI Talk: подключено к " + peer)
 		showNotification("AI Talk", "Подключено: "+peer, false)
 	}
+}
+
+// onMessage показывает входящее сообщение всплывающим уведомлением.
+func (a *trayApp) onMessage(m message) {
+	text := m.Text
+	if r := []rune(text); len(r) > 200 {
+		text = string(r[:200]) + "…"
+	}
+	showNotification("AI Talk: сообщение от "+m.From, text, false)
 }
 
 // statusLabel формирует текст пункта статуса в меню трея.

@@ -2,9 +2,11 @@
 
 *English version: [below](#english).*
 
-Демон для системного трея Windows 11: включает и выключает соединение между двумя компьютерами в домашней сети по WebSocket, показывая текущее состояние значком в трее (отключено / ожидание / подключено) и всплывающим уведомлением при каждом успешном подключении.
+Демон для системного трея Windows 11. Включает и выключает соединение по WebSocket между двумя компьютерами в домашней сети и передаёт по нему текстовые сообщения. Состояние (отключено / ожидание / подключено) видно по значку в трее; при подключении и при входящем сообщении всплывает уведомление.
 
-Протокол и сетевая часть — из [lanagent](https://github.com/des1roer/lanagent): общий секретный токен в заголовке `Authorization`, имя компьютера в `X-Agent-Host`, сторона-сервер слушает порт, сторона-клиент подключается и сама переподключается при обрыве. Сам обмен сообщениями lanagent сюда не перенесён — трею нужен только факт связи, а не чат.
+Главное назначение — переписка двух Claude Code на разных компьютерах. Демон отдаёт локальный API на `127.0.0.1`, а скилл [`skills/ai-talk`](skills/ai-talk/SKILL.md) учит Claude через этот API писать собеседнику и ждать ответа. Писать можно, только пока соединение включено в трее.
+
+Протокол и сетевая часть — из [lanagent](https://github.com/des1roer/lanagent): общий секретный токен в заголовке `Authorization`, имя компьютера в `X-Agent-Host`, сторона-сервер слушает порт, сторона-клиент подключается и сама переподключается при обрыве, на `ping` сторона отвечает `pong от <имя>`. Вместо stdin/stdout lanagent сообщения идут через локальный API.
 
 ## Возможности
 
@@ -16,6 +18,14 @@
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Необязательный файл `.env` для конфигурации; если его нет — переменные окружения, затем флаги.
 - Соединение включается автоматически при старте программы, если конфигурация задана.
+- Локальный API на `127.0.0.1:8767` (только loopback, каждый запрос — с заголовком `X-AI-Talk: 1`):
+  - `GET /status` — состояние, имя собеседника, номер последнего входящего;
+  - `POST /send` — отправить тело запроса собеседнику (до 1 МБ); 409, если соединение выключено в трее или собеседник не подключён;
+  - `GET /inbox?after=N&wait=15m` — входящие с номером больше N; `wait` держит запрос, пока не придёт новое (не дольше 15 минут). Хранятся последние 500 сообщений, до перезапуска программы.
+
+## Скилл для Claude Code
+
+Скопировать `skills/ai-talk` в `%USERPROFILE%\.claude\skills\ai-talk` на обоих компьютерах. После этого на просьбу вида «напиши второму клоду …» Claude проверяет `/status`, отправляет сообщение через `/send` и ждёт ответа в фоне через `/inbox?wait=`. Если соединение выключено в трее, Claude не включает его сам, а просит пользователя.
 
 ## Установка
 
@@ -43,6 +53,7 @@ go test ./...
 | `-listen`  | `AGENT_LISTEN`  | Слушать подключения, например `:8080`                            |
 | `-connect` | `AGENT_CONNECT` | Подключиться, например `ws://WIN-O3VIUQGMCM8:8080/ws`             |
 | `-token`   | `AGENT_TOKEN`   | Общий секрет для обеих сторон                                    |
+| —          | `AGENT_API_PORT`| Порт локального API на 127.0.0.1, по умолчанию `8767`            |
 | `-debug`   | —               | Показывать консоль с логами отладки                              |
 
 Если заданы и `AGENT_LISTEN`, и `AGENT_CONNECT` одновременно, побеждает режим сервера.
@@ -71,7 +82,8 @@ AGENT_TOKEN=supersecret
 
 **Объекты:**
 
-- `agent` — включение/выключение соединения: `Start`/`Stop` запускают/останавливают `runServer` (accept, одно соединение за раз) или `runClient` (dial с повторами) в зависимости от `cfg.mode`; `holdConnection` держит уже установленное соединение открытым (периодический ping + чтение, без обработки содержимого сообщений) до разрыва или отмены контекста;
+- `agent` — включение/выключение соединения: `Start`/`Stop` запускают/останавливают `runServer` (accept, одно соединение за раз) или `runClient` (dial с повторами) в зависимости от `cfg.mode`; `session` обслуживает установленное соединение (периодический ping, ответ на `ping`, входящие — в `inbox`), `Send` пишет в него;
+- `inbox` — последние входящие с возрастающими ID и ожиданием новых (`wait`); `apiHandler`/`serveAPI` — локальный API для скилла;
 - `trayApp` — связывает меню трея (`onReady`/`onExit`) с `agent` через колбэк `onStateChange`, который обновляет значок/подсказку/пункт статуса и показывает уведомление при подключении;
 - `config` — итоговые настройки (`resolveConfig`: флаги > окружение/`.env` > умолчания), `autostart` — автозапуск через `HKCU\...\Run`.
 
@@ -79,7 +91,7 @@ AGENT_TOKEN=supersecret
 
 **Ключевые решения:**
 
-- Не перенесены chat/stdin/stdout из lanagent — демону нужен только факт связи, значит состояние, а не сообщения.
+- Сообщения передаются через локальный HTTP API, а не через stdin/stdout, как в lanagent: демон живёт в трее без консоли, а Claude удобно вызывать `curl`. API слушает только loopback и требует заголовок `X-AI-Talk: 1` и loopback-`Host`. Иначе любая страница в браузере могла бы через `fetch` отправить второму Claude текст от имени пользователя (CSRF, DNS rebinding).
 - `systray` в этой программе не требует отдельной закреплённой горутины под Fyne (в отличие от volume_switch): здесь нет UI-окон, поэтому `systray.Run` вызывается прямо из `main()`.
 - Значок генерируется во время выполнения в трёх цветных вариантах (`iconOff`/`iconWaiting`/`iconConnected`) тем же приёмом, что и в volume_switch — PNG, обёрнутый в минимальный `.ico`, без внешнего файла ресурсов.
 
@@ -89,9 +101,9 @@ AGENT_TOKEN=supersecret
 
 # ai-talk (English)
 
-A Windows 11 system tray daemon: turns the WebSocket connection between two computers on a home network on and off, showing the current state via the tray icon (off / waiting / connected) and a balloon notification on every successful connection.
+A Windows 11 system tray daemon: turns the WebSocket connection between two computers on a home network on and off and carries text messages over it. The tray icon shows the state (off / waiting / connected); a balloon notification appears on connect and on every incoming message. Its main purpose is letting two Claude Code instances on different computers talk to each other: the daemon serves a local API on `127.0.0.1:8767`, and the [`skills/ai-talk`](skills/ai-talk/SKILL.md) skill teaches Claude to use it. Messaging works only while the connection is enabled in the tray.
 
-The protocol and networking code come from [lanagent](https://github.com/des1roer/lanagent): a shared secret token in the `Authorization` header, the computer name in `X-Agent-Host`, the server side listens on a port, the client side connects and reconnects on its own after a drop. lanagent's chat functionality (stdin/stdout messaging) was not carried over — the tray only needs the fact of the connection, not a chat.
+The protocol and networking code come from [lanagent](https://github.com/des1roer/lanagent): a shared secret token in the `Authorization` header, the computer name in `X-Agent-Host`, the server side listens on a port, the client side connects and reconnects on its own after a drop. Instead of lanagent's stdin/stdout, messages go through the local API (`GET /status`, `POST /send`, `GET /inbox?after=N&wait=15m`; loopback only, every request needs the `X-AI-Talk: 1` header).
 
 ## Features
 
@@ -120,6 +132,7 @@ Each of the two computers is configured separately: one gets `AGENT_LISTEN` (it 
 | `-listen`  | `AGENT_LISTEN`  | Listen for connections, e.g. `:8080`                       |
 | `-connect` | `AGENT_CONNECT` | Connect to, e.g. `ws://WIN-O3VIUQGMCM8:8080/ws`             |
 | `-token`   | `AGENT_TOKEN`   | Shared secret for both sides                               |
+| —          | `AGENT_API_PORT`| Local API port on 127.0.0.1, default `8767`                |
 | `-debug`   | —               | Show a console with debug logs                             |
 
 If both `AGENT_LISTEN` and `AGENT_CONNECT` are set, server mode wins.
