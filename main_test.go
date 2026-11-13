@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -484,6 +486,231 @@ func TestAgentClientConnects(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Обмен сообщениями и локальный API
+// ---------------------------------------------------------------------------
+
+// connectedPair поднимает в процессе сервер и клиент ai-talk и ждёт, пока они
+// соединятся.
+func connectedPair(t *testing.T) (server, client *agent) {
+	t.Helper()
+	addr := freeAddr(t)
+	server = newAgent(config{mode: "server", listenAddr: addr, token: "secret"}, nil)
+	client = newAgent(config{mode: "client", connectURL: "ws://" + addr + "/ws", token: "secret"}, nil)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Stop)
+	waitForState(t, server, stateWaiting)
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Stop)
+	waitForState(t, client, stateConnected)
+	waitForState(t, server, stateConnected)
+	return server, client
+}
+
+func waitInbox(t *testing.T, a *agent, after int) []message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	msgs, _ := a.inbox.wait(ctx, after)
+	if len(msgs) == 0 {
+		t.Fatal("сообщение не пришло")
+	}
+	return msgs
+}
+
+func TestAgentsExchangeMessages(t *testing.T) {
+	server, client := connectedPair(t)
+
+	if _, peer := client.State(); peer != host {
+		t.Errorf("клиент: peer = %q, want имя сервера %q из X-Agent-Host", peer, host)
+	}
+
+	long := strings.Repeat("я", 100_000) // больше 32 КБ — лимита websocket по умолчанию
+	if err := client.Send(context.Background(), long); err != nil {
+		t.Fatalf("client.Send: %v", err)
+	}
+	got := waitInbox(t, server, 0)
+	if got[0].Text != long || got[0].From != host || got[0].ID != 1 {
+		t.Errorf("сервер получил #%d от %q, %d байт", got[0].ID, got[0].From, len(got[0].Text))
+	}
+
+	if err := server.Send(context.Background(), "ответ"); err != nil {
+		t.Fatalf("server.Send: %v", err)
+	}
+	if got := waitInbox(t, client, 0); got[0].Text != "ответ" {
+		t.Errorf("клиент получил %q", got[0].Text)
+	}
+}
+
+func TestAgentAnswersPing(t *testing.T) {
+	server, client := connectedPair(t)
+	if err := client.Send(context.Background(), "ping"); err != nil {
+		t.Fatal(err)
+	}
+	got := waitInbox(t, client, 0)
+	if want := "pong от " + host; got[0].Text != want {
+		t.Errorf("ответ на ping = %q, want %q", got[0].Text, want)
+	}
+	if msgs, _, _ := server.inbox.after(0); len(msgs) != 0 {
+		t.Errorf("ping попал во входящие сервера: %v", msgs)
+	}
+}
+
+func TestAgentSendNotConnected(t *testing.T) {
+	a := newAgent(config{}, nil)
+	if err := a.Send(context.Background(), "x"); !errors.Is(err, errNotConnected) {
+		t.Errorf("Send без соединения = %v, want errNotConnected", err)
+	}
+}
+
+func TestInbox(t *testing.T) {
+	b := newInbox(3)
+	for i := range 5 {
+		b.add("P", fmt.Sprint(i))
+	}
+	msgs, last, _ := b.after(0)
+	if last != 5 || len(msgs) != 3 || msgs[0].ID != 3 {
+		t.Fatalf("after(0) = %v, last %d; want последние 3 из 5", msgs, last)
+	}
+	if msgs, _, _ := b.after(4); len(msgs) != 1 || msgs[0].Text != "4" {
+		t.Errorf("after(4) = %v", msgs)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if msgs, _ := b.wait(ctx, 5); len(msgs) != 0 {
+		t.Errorf("wait без новых сообщений вернул %v", msgs)
+	}
+
+	done := make(chan []message)
+	go func() {
+		msgs, _ := b.wait(context.Background(), 5)
+		done <- msgs
+	}()
+	time.Sleep(10 * time.Millisecond)
+	b.add("P", "новое")
+	select {
+	case msgs := <-done:
+		if len(msgs) != 1 || msgs[0].Text != "новое" {
+			t.Errorf("wait вернул %v", msgs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait не проснулся после add")
+	}
+}
+
+func TestParseWait(t *testing.T) {
+	for in, want := range map[string]time.Duration{"90": 90 * time.Second, "2m": 2 * time.Minute, "5h": maxWait} {
+		if got, err := parseWait(in); err != nil || got != want {
+			t.Errorf("parseWait(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"abc", "-1s"} {
+		if _, err := parseWait(in); err == nil {
+			t.Errorf("parseWait(%q): ожидалась ошибка", in)
+		}
+	}
+}
+
+func TestLoopbackHost(t *testing.T) {
+	for in, want := range map[string]bool{
+		"127.0.0.1:8767": true, "localhost:8767": true, "[::1]:8767": true, "127.0.0.1": true,
+		"evil.example:8767": false, "192.168.3.2:8767": false,
+	} {
+		if got := loopbackHost(in); got != want {
+			t.Errorf("loopbackHost(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// apiCall выполняет запрос к локальному API и разбирает JSON-ответ.
+func apiCall(t *testing.T, method, url, body string, header bool) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header {
+		req.Header.Set(apiHeader, "1")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func TestAPI(t *testing.T) {
+	server, client := connectedPair(t)
+	api := httptest.NewServer(client.apiHandler())
+	defer api.Close()
+
+	if code, _ := apiCall(t, "GET", api.URL+"/status", "", false); code != http.StatusForbidden {
+		t.Errorf("без заголовка %s: код %d, want 403", apiHeader, code)
+	}
+
+	code, st := apiCall(t, "GET", api.URL+"/status", "", true)
+	if code != http.StatusOK || st["state"] != "connected" || st["enabled"] != true || st["peer"] != host {
+		t.Errorf("/status = %d %v", code, st)
+	}
+
+	if code, _ := apiCall(t, "POST", api.URL+"/send", "  ", true); code != http.StatusBadRequest {
+		t.Errorf("пустое сообщение: код %d", code)
+	}
+	const text = "привет\nвторая строка"
+	if code, res := apiCall(t, "POST", api.URL+"/send", text, true); code != http.StatusOK {
+		t.Errorf("/send = %d %v", code, res)
+	}
+	if got := waitInbox(t, server, 0); got[0].Text != text {
+		t.Errorf("сервер получил %q", got[0].Text)
+	}
+
+	if err := server.Send(context.Background(), "ответ сервера"); err != nil {
+		t.Fatal(err)
+	}
+	code, res := apiCall(t, "GET", api.URL+"/inbox?after=0&wait=5", "", true)
+	msgs, _ := res["messages"].([]any)
+	if code != http.StatusOK || len(msgs) != 1 || msgs[0].(map[string]any)["text"] != "ответ сервера" || res["last_id"] != float64(1) {
+		t.Errorf("/inbox = %d %v", code, res)
+	}
+	start := time.Now()
+	code, res = apiCall(t, "GET", api.URL+"/inbox?after=1&wait=0.2s", "", true)
+	if msgs, _ := res["messages"].([]any); code != http.StatusOK || len(msgs) != 0 || time.Since(start) < 150*time.Millisecond {
+		t.Errorf("/inbox без новых = %d %v за %s", code, res, time.Since(start))
+	}
+	if code, _ := apiCall(t, "GET", api.URL+"/inbox?after=x", "", true); code != http.StatusBadRequest {
+		t.Errorf("after=x: код %d", code)
+	}
+
+	client.Stop()
+	if code, res := apiCall(t, "POST", api.URL+"/send", "x", true); code != http.StatusConflict {
+		t.Errorf("/send при выключенном соединении = %d %v, want 409", code, res)
+	}
+}
+
+func TestAPIRejectsForeignHost(t *testing.T) {
+	api := httptest.NewServer(newAgent(config{}, nil).apiHandler())
+	defer api.Close()
+	req, _ := http.NewRequest("GET", api.URL+"/status", nil)
+	req.Host = "evil.example"
+	req.Header.Set(apiHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("чужой Host: код %d, want 403", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Автозапуск
 // ---------------------------------------------------------------------------
 
@@ -513,6 +740,30 @@ func TestAutostart(t *testing.T) {
 	}
 	if err := run.Set(false); err != nil {
 		t.Errorf("повторное выключение: %v", err)
+	}
+}
+
+func TestSettings(t *testing.T) {
+	s := settings{key: tempRegistryKey(t)}
+	if !s.Bool(showMessagesName, true) || s.Bool(showMessagesName, false) {
+		t.Error("нет значения: должно вернуться умолчание")
+	}
+	if err := s.SetBool(showMessagesName, false); err != nil {
+		t.Fatal(err)
+	}
+	if s.Bool(showMessagesName, true) {
+		t.Error("после SetBool(false) значение true")
+	}
+	if err := s.SetBool(showMessagesName, true); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Bool(showMessagesName, false) {
+		t.Error("после SetBool(true) значение false")
+	}
+
+	missing := settings{key: `Software\ai_talk_test_no_such_key`}
+	if !missing.Bool(showMessagesName, true) {
+		t.Error("нет ключа: должно вернуться умолчание")
 	}
 }
 
