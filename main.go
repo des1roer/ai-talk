@@ -292,8 +292,8 @@ type config struct {
 
 // resolveConfig собирает настройки по приоритету: флаги, затем окружение (к
 // этому моменту в нём уже и значения из .env). Пустой флаг означает «не
-// задан». Если заданы и AGENT_LISTEN, и AGENT_CONNECT, побеждает режим
-// сервера.
+// задан». Если заданы и AGENT_LISTEN, и AGENT_CONNECT, работают оба сразу
+// (режим "both" — см. Start и addPeer).
 func resolveConfig(debug bool, listenFlag, connectFlag, tokenFlag string) config {
 	cfg := config{debug: debug}
 	cfg.listenAddr = os.Getenv("AGENT_LISTEN")
@@ -316,8 +316,7 @@ func resolveConfig(debug bool, listenFlag, connectFlag, tokenFlag string) config
 
 	switch {
 	case cfg.listenAddr != "" && cfg.connectURL != "":
-		log.Printf("config: заданы и AGENT_LISTEN, и AGENT_CONNECT — используется режим сервера")
-		cfg.mode = "server"
+		cfg.mode = "both"
 	case cfg.listenAddr != "":
 		cfg.mode = "server"
 	case cfg.connectURL != "":
@@ -392,10 +391,22 @@ var errNotConnected = errors.New("собеседник не подключён")
 //
 // Протокол — как у lanagent: WebSocket, токен в Authorization, имя компьютера
 // в X-Agent-Host, текстовые кадры; на "ping" сторона сама отвечает
-// "pong от <имя>". Start запускает сервер (accept) или клиент (dial с
-// повторами) по cfg.mode, Stop останавливает. Входящие сообщения
-// складываются в inbox, откуда их забирает локальный API (apiHandler).
+// "pong от <имя>". Start запускает сервер (accept), клиент (dial с
+// повторами) или оба сразу, смотря что задано в cfg, Stop останавливает.
+// Входящие сообщения складываются в inbox, откуда их забирает локальный API
+// (apiHandler).
 // ---------------------------------------------------------------------------
+
+// peerConn описывает одно установленное соединение: кто собеседник и кем оно
+// набрано (dialed=true — мы сами, через runClient; false — собеседник набрал
+// нас, через runServer). Нужно для дедупликации в режиме "both": если обе
+// стороны пары одновременно и слушают, и набирают друг друга, соединений
+// образуется два — addPeer оставляет то, что набрал участник с именем
+// меньшим по алфавиту, второе закрывает.
+type peerConn struct {
+	name   string
+	dialed bool
+}
 
 type agent struct {
 	cfg   config
@@ -405,8 +416,8 @@ type agent struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	state  connState
-	peer   string                     // имена подключённых собеседников через ", "
-	conns  map[*websocket.Conn]string // установленные соединения: conn -> имя собеседника
+	peer   string                       // имена подключённых собеседников через ", "
+	conns  map[*websocket.Conn]peerConn // установленные соединения: conn -> кто это и как набран
 
 	// onState вызывается при каждом изменении агрегатного состояния,
 	// onPeerConnected/onPeerDisconnected — при подключении/отключении
@@ -437,8 +448,10 @@ func (a *agent) State() (connState, string) {
 	return a.state, a.peer
 }
 
-// Start запускает сервер или клиент согласно cfg.mode. Повторный вызов,
-// пока соединение уже запущено, ничего не делает.
+// Start запускает сервер (если задан AGENT_LISTEN) и клиент (если задан
+// AGENT_CONNECT) — при "both" оба сразу, параллельно, деля один agent (общие
+// inbox и conns). Повторный вызов, пока соединение уже запущено, ничего не
+// делает.
 func (a *agent) Start() error {
 	if !a.cfg.configured() {
 		return errors.New("не настроено: задайте AGENT_LISTEN или AGENT_CONNECT, и AGENT_TOKEN")
@@ -449,6 +462,23 @@ func (a *agent) Start() error {
 		a.mu.Unlock()
 		return nil
 	}
+	a.mu.Unlock()
+
+	// net.Listen — синхронно и до setState(stateWaiting): иначе состояние
+	// становится "waiting" раньше, чем порт реально слушается, и тот, кто
+	// подключается сразу по "waiting", может на эту гонку попасть
+	// ("connection refused"). Так Start к тому же сразу возвращает ошибку
+	// про занятый порт, а не только тихо молчит в логе из фоновой горутины.
+	var ln net.Listener
+	if a.cfg.listenAddr != "" {
+		var err error
+		ln, err = net.Listen("tcp", a.cfg.listenAddr)
+		if err != nil {
+			return fmt.Errorf("слушать %s: %w", a.cfg.listenAddr, err)
+		}
+	}
+
+	a.mu.Lock()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	a.cancel = cancel
@@ -456,16 +486,26 @@ func (a *agent) Start() error {
 	a.mu.Unlock()
 
 	a.setState(stateWaiting, "")
-	go func() {
-		defer close(done)
-		switch a.cfg.mode {
-		case "server":
-			a.runServer(ctx)
-		case "client":
+	var wg sync.WaitGroup
+	if ln != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.runServer(ctx, ln)
+		}()
+	}
+	if a.cfg.connectURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			a.runClient(ctx)
-		}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(done)
 		if ctx.Err() == nil {
-			// Завершилось само (например, порт занят), а не через Stop().
+			// Обе половины завершились сами (например, порт занят), а не через Stop().
 			a.mu.Lock()
 			a.cancel = nil
 			a.done = nil
@@ -517,19 +557,64 @@ func (a *agent) forceOff() {
 	}
 }
 
-// addPeer регистрирует установленное соединение c с собеседником name,
-// пересчитывает агрегатное состояние/список имён и уведомляет onState и
-// onPeerConnected.
-func (a *agent) addPeer(c *websocket.Conn, name string) {
+// addPeer регистрирует установленное соединение c с собеседником name
+// (dialed — набрали мы сами или нас). Если с тем же именем (без учёта
+// регистра) уже есть соединение — это режим "both" на обеих сторонах пары
+// одновременно: дозвонились оба. Из двух оставляет то, что набрал участник
+// с именем, меньшим по алфавиту (сравниваются настоящие X-Agent-Host, а не
+// URL — поэтому дедупликация работает и когда AGENT_CONNECT указывает IP, в
+// отличие от решения по URL до набора); лишнее закрывает. Пересчитывает
+// агрегатное состояние/список имён и уведомляет onState/onPeerConnected.
+//
+// Вырожденный случай: если имя собеседника совпадает с нашим host (две
+// машины с одинаковым именем компьютера — в домашней сети маловероятно, но
+// возможно при ошибке конфигурации), сравнение не даёт решения, и обе
+// стороны симметрично могут закрыть не ту половину — тогда не выживет ни
+// одно из двух соединений. Не стали чинить отдельно: тривиально избегается
+// уникальными именами компьютеров, которые и так нужны для X-Agent-Host.
+func (a *agent) addPeer(c *websocket.Conn, name string, dialed bool) {
 	a.mu.Lock()
 	if a.conns == nil {
-		a.conns = make(map[*websocket.Conn]string)
+		a.conns = make(map[*websocket.Conn]peerConn)
 	}
-	a.conns[c] = name
+	var loser *websocket.Conn
+	for existing, info := range a.conns {
+		if !strings.EqualFold(info.name, name) {
+			continue
+		}
+		keepExisting := true
+		switch {
+		case strings.ToLower(host) < strings.ToLower(name):
+			keepExisting = info.dialed // дозваниваемся мы — оставляем набранное нами
+		case strings.ToLower(host) > strings.ToLower(name):
+			keepExisting = !info.dialed // дозванивается собеседник — оставляем принятое нами
+		}
+		if keepExisting {
+			loser = c
+		} else {
+			loser = existing
+			delete(a.conns, existing)
+		}
+		break
+	}
+	added := loser != c
+	if added {
+		a.conns[c] = peerConn{name: name, dialed: dialed}
+	}
 	joined := a.joinedPeersLocked()
 	a.state = stateConnected
 	a.peer = joined
 	a.mu.Unlock()
+
+	if loser != nil {
+		// CloseNow, а не graceful Close: дубликат мог ещё не начать читать (мы
+		// в этот момент сами стоим в начале его же session), рукопожатие
+		// закрытия с таким собеседником может зависнуть надолго.
+		loser.CloseNow()
+	}
+	if !added {
+		return
+	}
 	if a.onState != nil {
 		a.onState(stateConnected, joined)
 	}
@@ -540,10 +625,12 @@ func (a *agent) addPeer(c *websocket.Conn, name string) {
 
 // removePeer снимает соединение c с учёта и пересчитывает агрегатное
 // состояние: connected, если остались другие собеседники, иначе waiting
-// (если соединение всё ещё включено) или off.
+// (если соединение всё ещё включено) или off. Не связанное с подключённым
+// собеседником (например, только что продублированное и тут же закрытое в
+// addPeer) соединение убирается молча.
 func (a *agent) removePeer(c *websocket.Conn) {
 	a.mu.Lock()
-	name := a.conns[c]
+	info, ok := a.conns[c]
 	delete(a.conns, c)
 	joined := a.joinedPeersLocked()
 	var s connState
@@ -558,11 +645,14 @@ func (a *agent) removePeer(c *websocket.Conn) {
 	a.state = s
 	a.peer = joined
 	a.mu.Unlock()
+	if !ok {
+		return
+	}
 	if a.onState != nil {
 		a.onState(s, joined)
 	}
-	if name != "" && a.onPeerDisconnected != nil {
-		a.onPeerDisconnected(name)
+	if a.onPeerDisconnected != nil {
+		a.onPeerDisconnected(info.name)
 	}
 }
 
@@ -570,8 +660,8 @@ func (a *agent) removePeer(c *websocket.Conn) {
 // алфавиту. Вызывающий должен держать a.mu.
 func (a *agent) joinedPeersLocked() string {
 	names := make([]string, 0, len(a.conns))
-	for _, n := range a.conns {
-		names = append(names, n)
+	for _, info := range a.conns {
+		names = append(names, info.name)
 	}
 	slices.Sort(names)
 	return strings.Join(names, ", ")
@@ -582,11 +672,24 @@ func (a *agent) PeerNames() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	names := make([]string, 0, len(a.conns))
-	for _, n := range a.conns {
-		names = append(names, n)
+	for _, info := range a.conns {
+		names = append(names, info.name)
 	}
 	slices.Sort(names)
 	return names
+}
+
+// hasPeer сообщает, подключён ли сейчас собеседник с именем name (без учёта
+// регистра), независимо от того, через какое соединение.
+func (a *agent) hasPeer(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, info := range a.conns {
+		if strings.EqualFold(info.name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // Send отправляет text собеседникам по установленным соединениям: если to не
@@ -596,9 +699,9 @@ func (a *agent) PeerNames() []string {
 func (a *agent) Send(ctx context.Context, to, text string) ([]string, error) {
 	a.mu.Lock()
 	targets := make(map[*websocket.Conn]string, len(a.conns))
-	for c, name := range a.conns {
-		if to == "" || strings.EqualFold(name, to) {
-			targets[c] = name
+	for c, info := range a.conns {
+		if to == "" || strings.EqualFold(info.name, to) {
+			targets[c] = info.name
 		}
 	}
 	a.mu.Unlock()
@@ -627,9 +730,12 @@ func (a *agent) Send(ctx context.Context, to, text string) ([]string, error) {
 
 // runServer слушает cfg.listenAddr и принимает сколько угодно одновременных
 // соединений — каждое ведёт свою session в своей горутине (её запускает сам
-// net/http на каждый запрос). Останавливается, когда отменят ctx, закрывая
-// HTTP-сервер и все установленные соединения.
-func (a *agent) runServer(ctx context.Context) {
+// net/http на каждый запрос). ln уже слушает (см. Start — синхронно, до
+// setState). Останавливается, когда отменят ctx, закрывая HTTP-сервер,
+// слушатель и все установленные соединения.
+func (a *agent) runServer(ctx context.Context, ln net.Listener) {
+	defer ln.Close()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+a.cfg.token)) != 1 {
@@ -647,14 +753,14 @@ func (a *agent) runServer(ctx context.Context) {
 			peer = r.RemoteAddr
 		}
 		log.Printf("agent: соединение: %s", peer)
-		a.session(ctx, c, peer)
+		a.session(ctx, c, peer, false)
 		log.Printf("agent: соединение закрыто: %s", peer)
 	})
 
-	srv := &http.Server{Addr: a.cfg.listenAddr, Handler: mux}
+	srv := &http.Server{Handler: mux}
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-	log.Printf("agent: %s слушает %s", host, a.cfg.listenAddr)
+	go func() { errCh <- srv.Serve(ln) }()
+	log.Printf("agent: %s слушает %s", host, ln.Addr())
 
 	select {
 	case err := <-errCh:
@@ -689,11 +795,30 @@ func (a *agent) closeAllConns() {
 }
 
 // runClient подключается к cfg.connectURL и переподключается при обрыве,
-// пока не отменят ctx.
+// пока не отменят ctx. В режиме "both" (когда мы и так уже слушаем
+// cfg.listenAddr) обе стороны симметрично настроенной пары звонят друг другу
+// одновременно — лишнее из двух получившихся соединений закрывает addPeer
+// (см. его комментарий); здесь набор ничем не отличается от обычного
+// клиентского режима.
 func (a *agent) runClient(ctx context.Context) {
+	var knownPeer string // имя собеседника из прошлого успешного набора
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Если нас только что закрыл addPeer как дубль (в режиме "both" оба
+		// одновременно дозвонились друг до друга), связь с тем же именем уже
+		// держится через встречное соединение — незачем долбить повторным
+		// набором раз в reconnectDelay, он снова станет дублем и снова
+		// закроется. Ждём, пока оно пропадёт, и только тогда набираем опять.
+		if knownPeer != "" && a.hasPeer(knownPeer) {
+			select {
+			case <-time.After(dialRetryDelay):
+			case <-ctx.Done():
+				return
+			}
+			continue
 		}
 
 		dctx, cancel := context.WithTimeout(ctx, dialTimeout)
@@ -719,8 +844,9 @@ func (a *agent) runClient(ctx context.Context) {
 		if peer == "" {
 			peer = a.cfg.connectURL
 		}
+		knownPeer = peer
 		log.Printf("agent: подключено к %s (%s)", a.cfg.connectURL, peer)
-		a.session(ctx, c, peer)
+		a.session(ctx, c, peer, true)
 		log.Printf("agent: соединение потеряно")
 		if ctx.Err() != nil {
 			return
@@ -738,13 +864,13 @@ func (a *agent) runClient(ctx context.Context) {
 // чтобы заметить обрыв (например, ноутбук уснул), отвечает на "ping" и
 // складывает остальные входящие сообщения в inbox. Несколько session могут
 // выполняться одновременно (сервер с несколькими подключёнными пирами).
-func (a *agent) session(ctx context.Context, c *websocket.Conn, peer string) {
+func (a *agent) session(ctx context.Context, c *websocket.Conn, peer string, dialed bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer c.CloseNow()
 	c.SetReadLimit(maxMessageSize)
 
-	a.addPeer(c, peer)
+	a.addPeer(c, peer, dialed)
 	defer a.removePeer(c)
 
 	go func() {
@@ -1530,10 +1656,14 @@ func (a *trayApp) statusLabel(s connState, peer string) string {
 	case stateConnected:
 		return "Статус: подключено к " + peer
 	case stateWaiting:
-		if a.agent.cfg.mode == "server" {
+		switch a.agent.cfg.mode {
+		case "server":
 			return "Статус: ожидание подключения на " + a.agent.cfg.listenAddr
+		case "both":
+			return fmt.Sprintf("Статус: слушаю %s, набираю %s", a.agent.cfg.listenAddr, a.agent.cfg.connectURL)
+		default:
+			return "Статус: подключение к " + a.agent.cfg.connectURL
 		}
-		return "Статус: подключение к " + a.agent.cfg.connectURL
 	default:
 		return "Статус: отключено"
 	}

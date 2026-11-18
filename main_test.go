@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,9 +68,9 @@ func TestResolveConfig(t *testing.T) {
 			wantListen: ":9090",
 		},
 		{
-			name:        "заданы оба — побеждает сервер",
+			name:        "заданы оба — работают оба",
 			env:         map[string]string{"AGENT_LISTEN": ":8080", "AGENT_CONNECT": "ws://host:8080/ws"},
-			wantMode:    "server",
+			wantMode:    "both",
 			wantListen:  ":8080",
 			wantConnect: "ws://host:8080/ws",
 		},
@@ -281,6 +282,11 @@ func TestStatusLabel(t *testing.T) {
 	clientApp := &trayApp{agent: &agent{cfg: config{mode: "client", connectURL: "ws://host/ws"}}}
 	if got := clientApp.statusLabel(stateWaiting, ""); got != "Статус: подключение к ws://host/ws" {
 		t.Errorf("client waiting: %q", got)
+	}
+
+	bothApp := &trayApp{agent: &agent{cfg: config{mode: "both", listenAddr: ":8080", connectURL: "ws://host/ws"}}}
+	if got := bothApp.statusLabel(stateWaiting, ""); got != "Статус: слушаю :8080, набираю ws://host/ws" {
+		t.Errorf("both waiting: %q", got)
 	}
 }
 
@@ -496,6 +502,188 @@ func TestAgentServerAcceptsMultiplePeers(t *testing.T) {
 	}
 	if s, _ := a.State(); s != stateConnected {
 		t.Errorf("State() после отключения одного из двух = %v, want stateConnected", s)
+	}
+}
+
+// TestAgentAddPeerDeduplicatesByName проверяет дедупликацию в addPeer: если
+// одно и то же имя пришло по двум соединениям сразу (режим "both" на обеих
+// сторонах симметричной пары — звонят друг другу одновременно), остаётся
+// только одно, набранное участником с именем меньшим по алфавиту. Сравнение
+// идёт по именам из X-Agent-Host, поэтому неважно, IP или хостнейм был в
+// AGENT_CONNECT — вызываем addPeer напрямую, минуя набор/приём, с
+// настоящими websocket.Conn (нужны для настоящего Close/Read).
+func TestAgentAddPeerDeduplicatesByName(t *testing.T) {
+	setVar(t, &host, "bbb-self")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer srv.Close()
+	wsURL := "ws://" + strings.TrimPrefix(srv.URL, "http://") + "/ws"
+
+	dial := func() *websocket.Conn {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		return c
+	}
+
+	a := newAgent(config{}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// "bbb-self" < "ccc-peer" — дозваниваемся мы; должно остаться dialed=true.
+	dialedConn := dial()
+	defer dialedConn.CloseNow()
+	a.addPeer(dialedConn, "ccc-peer", true)
+
+	acceptedConn := dial()
+	defer acceptedConn.CloseNow()
+	a.addPeer(acceptedConn, "ccc-peer", false)
+
+	if names := a.PeerNames(); !slices.Equal(names, []string{"ccc-peer"}) {
+		t.Fatalf("PeerNames() = %v, want ровно [ccc-peer], не дубль", names)
+	}
+	if _, _, err := acceptedConn.Read(ctx); err == nil {
+		t.Error("дублирующее принятое соединение (ccc-peer) не было закрыто")
+	}
+
+	// "bbb-self" > "aaa-peer" — набирает собеседник; должно остаться dialed=false.
+	dialedConn2 := dial()
+	defer dialedConn2.CloseNow()
+	a.addPeer(dialedConn2, "aaa-peer", true)
+
+	acceptedConn2 := dial()
+	defer acceptedConn2.CloseNow()
+	a.addPeer(acceptedConn2, "aaa-peer", false)
+
+	if names := a.PeerNames(); !slices.Equal(names, []string{"aaa-peer", "ccc-peer"}) {
+		t.Fatalf("PeerNames() = %v, want [aaa-peer ccc-peer]", names)
+	}
+	if _, _, err := dialedConn2.Read(ctx); err == nil {
+		t.Error("дублирующее набранное нами соединение (aaa-peer) не было закрыто")
+	}
+}
+
+// TestAgentClientWaitsInsteadOfRedialingAfterDedup проверяет исправление
+// перезвона: если наш набор проиграл дедупликацию в addPeer (связь с тем же
+// именем уже держится через встречное соединение), runClient не должен
+// сразу пытаться дозвониться снова — иначе каждый повтор снова станет
+// дублем и снова закроется, раз в reconnectDelay, бесконечно.
+func TestAgentClientWaitsInsteadOfRedialingAfterDedup(t *testing.T) {
+	setVar(t, &host, "zzz-self") // "zzz-self" > "aaa-remote" — наш набор проигрывает
+
+	fakeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer fakeSrv.Close()
+	fakeConn, _, err := websocket.Dial(context.Background(), "ws://"+strings.TrimPrefix(fakeSrv.URL, "http://")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("Dial fakeConn: %v", err)
+	}
+	defer fakeConn.CloseNow()
+
+	var dialCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialCount.Add(1)
+		w.Header().Set("X-Agent-Host", "aaa-remote")
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer srv.Close()
+	wsURL := "ws://" + strings.TrimPrefix(srv.URL, "http://") + "/ws"
+
+	a := newAgent(config{mode: "client", connectURL: wsURL, token: "secret"}, nil)
+	a.addPeer(fakeConn, "aaa-remote", false) // уже подключённый "встречный звонок"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.runClient(ctx)
+
+	time.Sleep(2500 * time.Millisecond)
+
+	if n := dialCount.Load(); n != 1 {
+		t.Errorf("dialCount = %d за 2.5 с, want 1 — после проигрыша дедупликации runClient не должен долбить повторным набором, пока связь с тем же именем ещё жива", n)
+	}
+}
+
+// TestAgentBothModeRunsServerAndClient проверяет режим "both": один agent
+// одновременно слушает и дозванивается. host — один общий глобальный var
+// для всего тестового процесса, поэтому обе стороны этого теста неизбежно
+// называют себя одинаково ("aaa-local") — сравнивается только то, что обе
+// половины вообще работают, а не точные имена пиров друг у друга.
+func TestAgentBothModeRunsServerAndClient(t *testing.T) {
+	setVar(t, &host, "aaa-local")
+
+	remoteAddr := freeAddr(t)
+	remote := newAgent(config{mode: "server", listenAddr: remoteAddr, token: "secret"}, nil)
+	if err := remote.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(remote.Stop)
+	waitForState(t, remote, stateWaiting)
+
+	_, port, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localAddr := freeAddr(t)
+	local := newAgent(config{
+		mode:       "both",
+		listenAddr: localAddr,
+		connectURL: "ws://localhost:" + port + "/ws", // "aaa-local" < "localhost" — дозваниваемся
+		token:      "secret",
+	}, nil)
+	if err := local.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Stop)
+
+	// Клиентская половина local дозвонилась до remote.
+	waitForState(t, remote, stateConnected)
+	if names := remote.PeerNames(); !slices.Equal(names, []string{"aaa-local"}) {
+		t.Fatalf("remote.PeerNames() = %v, want [aaa-local]", names)
+	}
+
+	// Серверная половина local тоже принимает входящие — проверяем третьим клиентом.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws://"+localAddr+"/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer secret"}, "X-Agent-Host": {"THIRD"}},
+	})
+	if err != nil {
+		t.Fatalf("Dial в серверную половину local: %v", err)
+	}
+	defer c.CloseNow()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if names := local.PeerNames(); slices.Equal(names, []string{"THIRD", "aaa-local"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("local.PeerNames() = %v, want [THIRD aaa-local]", local.PeerNames())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
