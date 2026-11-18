@@ -21,6 +21,8 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
 
     fun send(text: String): Boolean = manager.send(text)
 
+    fun retry(id: Long) = manager.retry(id)
+
     fun restartWithNewSettings() {
         val wasRunning = manager.isRunning()
         manager.stop()

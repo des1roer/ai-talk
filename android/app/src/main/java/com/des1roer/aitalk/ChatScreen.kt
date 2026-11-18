@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -81,7 +82,9 @@ fun ChatScreen(viewModel: ConnectionViewModel, onOpenSettings: () -> Unit) {
                 contentPadding = PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(messages, key = { it.id }) { message -> MessageBubble(message) }
+                items(messages, key = { it.id }) { message ->
+                    MessageBubble(message, onRetry = { viewModel.retry(message.id) })
+                }
             }
             Row(
                 modifier = Modifier
@@ -96,10 +99,12 @@ fun ChatScreen(viewModel: ConnectionViewModel, onOpenSettings: () -> Unit) {
                     placeholder = { Text("Сообщение") },
                 )
                 Spacer(Modifier.width(8.dp))
-                val connected = state is ConnectionState.Connected
                 Button(
-                    enabled = connected && input.isNotBlank(),
-                    onClick = { if (viewModel.send(input)) input = "" },
+                    enabled = input.isNotBlank(),
+                    onClick = {
+                        viewModel.send(input)
+                        input = ""
+                    },
                 ) { Text("Отправить") }
             }
         }
@@ -113,9 +118,11 @@ private fun statusText(state: ConnectionState): String = when (state) {
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage) {
+private fun MessageBubble(message: ChatMessage, onRetry: () -> Unit) {
     val alignment = if (message.fromSelf) Alignment.End else Alignment.Start
-    val color = if (message.fromSelf) {
+    val color = if (message.failed) {
+        MaterialTheme.colorScheme.errorContainer
+    } else if (message.fromSelf) {
         MaterialTheme.colorScheme.primaryContainer
     } else {
         MaterialTheme.colorScheme.surfaceVariant
@@ -124,10 +131,28 @@ private fun MessageBubble(message: ChatMessage) {
         Surface(color = color, shape = MaterialTheme.shapes.medium) {
             Text(text = message.text, modifier = Modifier.padding(10.dp))
         }
-        Text(
-            text = DateFormat.format("HH:mm", message.timestamp).toString(),
-            style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.padding(horizontal = 4.dp),
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (message.failed) {
+                Text(
+                    text = "не доставлено",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                IconButton(onClick = onRetry, modifier = Modifier.width(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = "Повторить отправку",
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                }
+            } else {
+                Text(
+                    text = DateFormat.format("HH:mm", message.timestamp).toString(),
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+            }
+        }
     }
 }
