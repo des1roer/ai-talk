@@ -415,7 +415,7 @@ func TestAgentServerRejectsBadToken(t *testing.T) {
 	}
 }
 
-func TestAgentServerRejectsSecondConnection(t *testing.T) {
+func TestAgentServerAcceptsMultiplePeers(t *testing.T) {
 	addr := freeAddr(t)
 	a := newAgent(config{mode: "server", listenAddr: addr, token: "secret"}, nil)
 	if err := a.Start(); err != nil {
@@ -442,13 +442,60 @@ func TestAgentServerRejectsSecondConnection(t *testing.T) {
 
 	second := dial("SECOND")
 	defer second.CloseNow()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if names := a.PeerNames(); slices.Equal(names, []string{"FIRST", "SECOND"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PeerNames() = %v, want [FIRST SECOND]", a.PeerNames())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, peer := a.State(); peer != "FIRST, SECOND" {
+		t.Errorf("peer = %q, want \"FIRST, SECOND\"", peer)
+	}
+
+	// Адресная отправка: уходит только названному собеседнику.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, _, err := second.Read(ctx); err == nil {
-		t.Error("второе соединение не было закрыто сервером")
+	if _, err := a.Send(context.Background(), "SECOND", "только второму"); err != nil {
+		t.Fatalf("Send(to=SECOND): %v", err)
 	}
-	if _, peer := a.State(); peer != "FIRST" {
-		t.Errorf("peer = %q, want FIRST (второе соединение не должно было вытеснить первое)", peer)
+	if _, data, err := second.Read(ctx); err != nil || string(data) != "только второму" {
+		t.Errorf("SECOND получил %q, %v", data, err)
+	}
+
+	// Рассылка: уходит обоим.
+	sent, err := a.Send(context.Background(), "", "всем")
+	if err != nil {
+		t.Fatalf("Send(broadcast): %v", err)
+	}
+	if !slices.Equal(sent, []string{"FIRST", "SECOND"}) {
+		t.Errorf("Send(broadcast) sent = %v, want [FIRST SECOND]", sent)
+	}
+	if _, data, err := first.Read(ctx); err != nil || string(data) != "всем" {
+		t.Errorf("FIRST получил %q, %v", data, err)
+	}
+	if _, data, err := second.Read(ctx); err != nil || string(data) != "всем" {
+		t.Errorf("SECOND получил %q, %v", data, err)
+	}
+
+	// Отключение одного не рвёт остальных и не стирает состояние connected.
+	first.CloseNow()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if names := a.PeerNames(); slices.Equal(names, []string{"SECOND"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PeerNames() после отключения FIRST = %v, want [SECOND]", a.PeerNames())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s, _ := a.State(); s != stateConnected {
+		t.Errorf("State() после отключения одного из двух = %v, want stateConnected", s)
 	}
 }
 
@@ -529,7 +576,7 @@ func TestAgentsExchangeMessages(t *testing.T) {
 	}
 
 	long := strings.Repeat("я", 100_000) // больше 32 КБ — лимита websocket по умолчанию
-	if err := client.Send(context.Background(), long); err != nil {
+	if _, err := client.Send(context.Background(), "", long); err != nil {
 		t.Fatalf("client.Send: %v", err)
 	}
 	got := waitInbox(t, server, 0)
@@ -537,7 +584,7 @@ func TestAgentsExchangeMessages(t *testing.T) {
 		t.Errorf("сервер получил #%d от %q, %d байт", got[0].ID, got[0].From, len(got[0].Text))
 	}
 
-	if err := server.Send(context.Background(), "ответ"); err != nil {
+	if _, err := server.Send(context.Background(), "", "ответ"); err != nil {
 		t.Fatalf("server.Send: %v", err)
 	}
 	if got := waitInbox(t, client, 0); got[0].Text != "ответ" {
@@ -547,7 +594,7 @@ func TestAgentsExchangeMessages(t *testing.T) {
 
 func TestAgentAnswersPing(t *testing.T) {
 	server, client := connectedPair(t)
-	if err := client.Send(context.Background(), "ping"); err != nil {
+	if _, err := client.Send(context.Background(), "", "ping"); err != nil {
 		t.Fatal(err)
 	}
 	got := waitInbox(t, client, 0)
@@ -561,7 +608,7 @@ func TestAgentAnswersPing(t *testing.T) {
 
 func TestAgentSendNotConnected(t *testing.T) {
 	a := newAgent(config{}, nil)
-	if err := a.Send(context.Background(), "x"); !errors.Is(err, errNotConnected) {
+	if _, err := a.Send(context.Background(), "", "x"); !errors.Is(err, errNotConnected) {
 		t.Errorf("Send без соединения = %v, want errNotConnected", err)
 	}
 }
@@ -659,6 +706,9 @@ func TestAPI(t *testing.T) {
 	if code != http.StatusOK || st["state"] != "connected" || st["enabled"] != true || st["peer"] != host {
 		t.Errorf("/status = %d %v", code, st)
 	}
+	if peers, _ := st["peers"].([]any); len(peers) != 1 || peers[0] != host {
+		t.Errorf("/status peers = %v, want [%s]", st["peers"], host)
+	}
 
 	if code, _ := apiCall(t, "POST", api.URL+"/send", "  ", true); code != http.StatusBadRequest {
 		t.Errorf("пустое сообщение: код %d", code)
@@ -671,7 +721,7 @@ func TestAPI(t *testing.T) {
 		t.Errorf("сервер получил %q", got[0].Text)
 	}
 
-	if err := server.Send(context.Background(), "ответ сервера"); err != nil {
+	if _, err := server.Send(context.Background(), "", "ответ сервера"); err != nil {
 		t.Fatal(err)
 	}
 	code, res := apiCall(t, "GET", api.URL+"/inbox?after=0&wait=5", "", true)
