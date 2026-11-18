@@ -19,7 +19,7 @@ import okhttp3.WebSocketListener
 
 private const val RECONNECT_DELAY_MS = 3_000L
 
-class ConnectionManager(private val settings: SettingsStore) {
+class ConnectionManager(private val settings: SettingsStore, private val messageStore: MessageStore) {
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
@@ -27,7 +27,9 @@ class ConnectionManager(private val settings: SettingsStore) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
     private var webSocket: WebSocket? = null
-    private var nextId = 0L
+
+    private val storedMessages = messageStore.load()
+    private var nextId = (storedMessages.maxOfOrNull { it.id } ?: -1L) + 1
 
     @Volatile
     private var running = false
@@ -35,7 +37,7 @@ class ConnectionManager(private val settings: SettingsStore) {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Off)
     val state: StateFlow<ConnectionState> = _state.asStateFlow()
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    private val _messages = MutableStateFlow(storedMessages)
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
     fun isRunning(): Boolean = running
@@ -66,6 +68,7 @@ class ConnectionManager(private val settings: SettingsStore) {
         val message = _messages.value.find { it.id == id } ?: return
         val ok = trySend(message.text)
         _messages.value = _messages.value.map { if (it.id == id) it.copy(failed = !ok) else it }
+        persist()
     }
 
     private fun trySend(text: String): Boolean {
@@ -125,5 +128,11 @@ class ConnectionManager(private val settings: SettingsStore) {
             failed = failed,
         )
         _messages.value = _messages.value + message
+        persist()
+    }
+
+    private fun persist() {
+        val snapshot = _messages.value
+        scope.launch { messageStore.save(snapshot) }
     }
 }

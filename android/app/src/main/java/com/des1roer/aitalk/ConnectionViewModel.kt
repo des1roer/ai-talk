@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 
 class ConnectionViewModel(application: Application) : AndroidViewModel(application) {
     val settingsStore = SettingsStore(application)
-    private val manager = ConnectionManager(settingsStore)
+    private val manager = ConnectionManager(settingsStore, MessageStore(application))
 
     val state: StateFlow<ConnectionState> = manager.state
     val messages: StateFlow<List<ChatMessage>> = manager.messages
