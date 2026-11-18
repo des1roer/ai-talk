@@ -2,7 +2,7 @@
 
 *English version: [below](#english).*
 
-Демон для системного трея Windows 11. Включает и выключает соединение по WebSocket между двумя компьютерами в домашней сети и передаёт по нему текстовые сообщения. Состояние (отключено / ожидание / подключено) видно по значку в трее; при подключении и при входящем сообщении всплывает уведомление.
+Демон для системного трея Windows 11. Включает и выключает соединения по WebSocket с компьютерами в домашней сети и передаёт по ним текстовые сообщения. Состояние (отключено / ожидание / подключено) видно по значку в трее; при подключении и при входящем сообщении всплывает уведомление.
 
 Главное назначение — переписка двух Claude Code на разных компьютерах. Демон отдаёт локальный API на `127.0.0.1`, а скилл [`skills/ai-talk`](skills/ai-talk/SKILL.md) учит Claude через этот API писать собеседнику и ждать ответа. Писать можно, только пока соединение включено в трее.
 
@@ -12,17 +12,17 @@
 
 - Какая сторона — сервер (`AGENT_LISTEN`) или клиент (`AGENT_CONNECT`) — решается конфигурацией на каждом компьютере; переключать роль на лету не нужно.
 - Пункт меню «Включить/выключить соединение» запускает и останавливает сервер (приём подключений) или клиента (подключение с автоматическими повторами при обрыве) без перезапуска программы.
-- Значок в трее и всплывающее уведомление отражают состояние: отключено, ожидание подключения, подключено (с именем собеседника).
+- Значок в трее и всплывающее уведомление отражают состояние: отключено, ожидание подключения, подключено (с именами собеседников).
 - При включении клиент сам переподключается каждые несколько секунд, пока связь не настроена; при разрыве уже установленного соединения — тоже.
-- Сервер принимает только одно соединение за раз — второе отклоняется, пока первое не закроется.
+- Сервер принимает сколько угодно одновременных подключений (например, второй компьютер и телефон с Android-клиентом сразу) — каждое отдельное отключение не трогает остальные.
 - Пункт меню «Показывать входящие сообщения» (с галочкой, по умолчанию включён) включает/выключает всплывающие уведомления о сообщениях. Сообщения при этом всё равно попадают во входящие API. Выбор сохраняется в `HKCU\Software\ai-talk`.
 - Пункт меню «Запускать при входе в Windows» (с галочкой) включает/выключает автозапуск через `HKCU\...\Run`.
 - Необязательный файл `.env` для конфигурации; если его нет — переменные окружения, затем флаги.
 - Соединение включается автоматически при старте программы, если конфигурация задана.
 - Локальный API на `127.0.0.1:8767` (только loopback, каждый запрос — с заголовком `X-AI-Talk: 1`):
-  - `GET /status` — состояние, имя собеседника, номер последнего входящего;
-  - `POST /send` — отправить тело запроса собеседнику (до 1 МБ); 409, если соединение выключено в трее или собеседник не подключён;
-  - `GET /inbox?after=N&wait=15m` — входящие с номером больше N; `wait` держит запрос, пока не придёт новое (не дольше 15 минут). Хранятся последние 500 сообщений, до перезапуска программы.
+  - `GET /status` — состояние, список подключённых собеседников (`peers`) и их имена через запятую (`peer`, для обратной совместимости), номер последнего входящего;
+  - `POST /send?to=имя` — отправить тело запроса (до 1 МБ) собеседнику с таким именем (`X-Agent-Host`); без `to` — всем, кто сейчас подключён. 409, если соединение выключено в трее или подходящих собеседников нет;
+  - `GET /inbox?after=N&wait=15m` — входящие от любого собеседника с номером больше N (поле `from` у каждого сообщения — чьё оно); `wait` держит запрос, пока не придёт новое (не дольше 15 минут). Хранятся последние 500 сообщений, до перезапуска программы.
 
 ## Скилл для Claude Code
 
@@ -83,7 +83,7 @@ AGENT_TOKEN=supersecret
 
 **Объекты:**
 
-- `agent` — включение/выключение соединения: `Start`/`Stop` запускают/останавливают `runServer` (accept, одно соединение за раз) или `runClient` (dial с повторами) в зависимости от `cfg.mode`; `session` обслуживает установленное соединение (периодический ping, ответ на `ping`, входящие — в `inbox`), `Send` пишет в него;
+- `agent` — включение/выключение соединений: `Start`/`Stop` запускают/останавливают `runServer` (accept, сколько угодно одновременных подключений) или `runClient` (dial с повторами) в зависимости от `cfg.mode`; `session` обслуживает одно установленное соединение (периодический ping, ответ на `ping`, входящие — в `inbox`) — их может быть несколько параллельно; `conns` хранит все текущие (conn → имя), `addPeer`/`removePeer` пересчитывают агрегатное состояние; `Send` пишет одному собеседнику по имени (`to`) или рассылает всем;
 - `inbox` — последние входящие с возрастающими ID и ожиданием новых (`wait`); `apiHandler`/`serveAPI` — локальный API для скилла;
 - `trayApp` — связывает меню трея (`onReady`/`onExit`) с `agent` через колбэк `onStateChange`, который обновляет значок/подсказку/пункт статуса и показывает уведомление при подключении;
 - `config` — итоговые настройки (`resolveConfig`: флаги > окружение/`.env` > умолчания), `autostart` — автозапуск через `HKCU\...\Run`.
@@ -102,17 +102,17 @@ AGENT_TOKEN=supersecret
 
 # ai-talk (English)
 
-A Windows 11 system tray daemon: turns the WebSocket connection between two computers on a home network on and off and carries text messages over it. The tray icon shows the state (off / waiting / connected); a balloon notification appears on connect and on every incoming message. Its main purpose is letting two Claude Code instances on different computers talk to each other: the daemon serves a local API on `127.0.0.1:8767`, and the [`skills/ai-talk`](skills/ai-talk/SKILL.md) skill teaches Claude to use it. Messaging works only while the connection is enabled in the tray.
+A Windows 11 system tray daemon: turns WebSocket connections to computers on a home network on and off and carries text messages over them. The tray icon shows the state (off / waiting / connected); a balloon notification appears on connect and on every incoming message. Its main purpose is letting two Claude Code instances on different computers talk to each other: the daemon serves a local API on `127.0.0.1:8767`, and the [`skills/ai-talk`](skills/ai-talk/SKILL.md) skill teaches Claude to use it. Messaging works only while the connection is enabled in the tray.
 
-The protocol and networking code come from [lanagent](https://github.com/des1roer/lanagent): a shared secret token in the `Authorization` header, the computer name in `X-Agent-Host`, the server side listens on a port, the client side connects and reconnects on its own after a drop. Instead of lanagent's stdin/stdout, messages go through the local API (`GET /status`, `POST /send`, `GET /inbox?after=N&wait=15m`; loopback only, every request needs the `X-AI-Talk: 1` header).
+The protocol and networking code come from [lanagent](https://github.com/des1roer/lanagent): a shared secret token in the `Authorization` header, the computer name in `X-Agent-Host`, the server side listens on a port, the client side connects and reconnects on its own after a drop. Instead of lanagent's stdin/stdout, messages go through the local API (`GET /status`, `POST /send?to=name`, `GET /inbox?after=N&wait=15m`; loopback only, every request needs the `X-AI-Talk: 1` header).
 
 ## Features
 
 - Which side is the server (`AGENT_LISTEN`) or the client (`AGENT_CONNECT`) is decided by configuration on each computer; no need to switch roles at runtime.
 - The "Включить/выключить соединение" ("Toggle connection") tray menu item starts and stops the server (accepting connections) or the client (connecting, with automatic retries on drop) without restarting the program.
-- The tray icon and a balloon notification reflect the state: off, waiting for a connection, connected (with the peer's name).
+- The tray icon and a balloon notification reflect the state: off, waiting for a connection, connected (with the peers' names).
 - When enabled, the client keeps reconnecting every few seconds until the link is up; the same happens after an established connection drops.
-- The server accepts only one connection at a time — a second one is rejected until the first closes.
+- The server accepts any number of simultaneous connections (e.g. a second computer and a phone running the Android client at the same time) — one dropping doesn't affect the others.
 - The "Показывать входящие сообщения" ("Show incoming messages") menu item, with a checkmark (on by default), turns message balloon notifications on and off; messages still reach the API inbox. The choice is saved in `HKCU\Software\ai-talk`.
 - The "Запускать при входе в Windows" ("Run at Windows sign-in") menu item, with a checkmark, enables/disables autostart via `HKCU\...\Run`.
 - An optional `.env` file for configuration; falls back to environment variables, then flags.

@@ -1,6 +1,6 @@
 // Command ai-talk сидит в системном трее и держит (или не держит —
-// переключателем в меню) соединение между двумя компьютерами в домашней
-// сети поверх WebSocket, используя тот же протокол, что и lanagent:
+// переключателем в меню) соединения с компьютерами в домашней сети поверх
+// WebSocket, используя тот же протокол, что и lanagent:
 // общий секретный токен в заголовке Authorization и заголовок
 // X-Agent-Host с именем компьютера.
 //
@@ -405,13 +405,17 @@ type agent struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	state  connState
-	peer   string
-	conn   *websocket.Conn // установленное соединение, nil — нет
+	peer   string                     // имена подключённых собеседников через ", "
+	conns  map[*websocket.Conn]string // установленные соединения: conn -> имя собеседника
 
-	// onState вызывается при каждом изменении состояния, onMessage — на
-	// каждое входящее сообщение (кроме ping). Задаются до Start.
-	onState   func(state connState, peer string)
-	onMessage func(m message)
+	// onState вызывается при каждом изменении агрегатного состояния,
+	// onPeerConnected/onPeerDisconnected — при подключении/отключении
+	// конкретного собеседника (в т.ч. когда он не единственный), onMessage —
+	// на каждое входящее сообщение (кроме ping). Задаются до Start.
+	onState            func(state connState, peer string)
+	onMessage          func(m message)
+	onPeerConnected    func(peer string)
+	onPeerDisconnected func(peer string)
 }
 
 func newAgent(cfg config, onState func(connState, string)) *agent {
@@ -466,7 +470,7 @@ func (a *agent) Start() error {
 			a.cancel = nil
 			a.done = nil
 			a.mu.Unlock()
-			a.setState(stateOff, "")
+			a.forceOff()
 		}
 	}()
 	return nil
@@ -485,7 +489,7 @@ func (a *agent) Stop() {
 	}
 	cancel()
 	<-done
-	a.setState(stateOff, "")
+	a.forceOff()
 }
 
 func (a *agent) setState(s connState, peer string) {
@@ -498,38 +502,134 @@ func (a *agent) setState(s connState, peer string) {
 	}
 }
 
-// Send отправляет текст собеседнику по установленному соединению.
-func (a *agent) Send(ctx context.Context, text string) error {
+// forceOff сбрасывает состояние в "выключено" и разрывает учёт всех
+// соединений — используется там, где агрегатное состояние должно стать
+// определённым независимо от того, что происходит в уже завершающихся
+// session (Stop, самопроизвольное завершение runServer/runClient).
+func (a *agent) forceOff() {
 	a.mu.Lock()
-	c := a.conn
+	a.conns = nil
+	a.state = stateOff
+	a.peer = ""
 	a.mu.Unlock()
-	if c == nil {
-		return errNotConnected
+	if a.onState != nil {
+		a.onState(stateOff, "")
 	}
-	wctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	return c.Write(wctx, websocket.MessageText, []byte(text))
 }
 
-// runServer слушает cfg.listenAddr и принимает одно соединение за раз;
-// второе одновременное подключение отклоняется. Останавливается, когда
-// отменят ctx, закрывая HTTP-сервер и текущее соединение (если есть).
-func (a *agent) runServer(ctx context.Context) {
-	var active atomic.Pointer[websocket.Conn]
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-	go func() {
-		select {
-		case <-ctx.Done():
-			// http.Server.Shutdown не закрывает upgrade'нутые соединения.
-			if c := active.Load(); c != nil {
-				c.CloseNow()
-			}
-		case <-stopWatch:
-		}
-	}()
+// addPeer регистрирует установленное соединение c с собеседником name,
+// пересчитывает агрегатное состояние/список имён и уведомляет onState и
+// onPeerConnected.
+func (a *agent) addPeer(c *websocket.Conn, name string) {
+	a.mu.Lock()
+	if a.conns == nil {
+		a.conns = make(map[*websocket.Conn]string)
+	}
+	a.conns[c] = name
+	joined := a.joinedPeersLocked()
+	a.state = stateConnected
+	a.peer = joined
+	a.mu.Unlock()
+	if a.onState != nil {
+		a.onState(stateConnected, joined)
+	}
+	if a.onPeerConnected != nil {
+		a.onPeerConnected(name)
+	}
+}
 
-	var sessionMu sync.Mutex
+// removePeer снимает соединение c с учёта и пересчитывает агрегатное
+// состояние: connected, если остались другие собеседники, иначе waiting
+// (если соединение всё ещё включено) или off.
+func (a *agent) removePeer(c *websocket.Conn) {
+	a.mu.Lock()
+	name := a.conns[c]
+	delete(a.conns, c)
+	joined := a.joinedPeersLocked()
+	var s connState
+	switch {
+	case joined != "":
+		s = stateConnected
+	case a.cancel != nil:
+		s = stateWaiting
+	default:
+		s = stateOff
+	}
+	a.state = s
+	a.peer = joined
+	a.mu.Unlock()
+	if a.onState != nil {
+		a.onState(s, joined)
+	}
+	if name != "" && a.onPeerDisconnected != nil {
+		a.onPeerDisconnected(name)
+	}
+}
+
+// joinedPeersLocked возвращает имена подключённых собеседников через ", " по
+// алфавиту. Вызывающий должен держать a.mu.
+func (a *agent) joinedPeersLocked() string {
+	names := make([]string, 0, len(a.conns))
+	for _, n := range a.conns {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return strings.Join(names, ", ")
+}
+
+// PeerNames возвращает имена сейчас подключённых собеседников по алфавиту.
+func (a *agent) PeerNames() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make([]string, 0, len(a.conns))
+	for _, n := range a.conns {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Send отправляет text собеседникам по установленным соединениям: если to не
+// пусто — только тому, чьё имя (X-Agent-Host) совпадает с to, иначе всем, кто
+// сейчас подключён. Возвращает имена тех, кому реально удалось отправить;
+// errNotConnected — если подходящих собеседников нет вовсе.
+func (a *agent) Send(ctx context.Context, to, text string) ([]string, error) {
+	a.mu.Lock()
+	targets := make(map[*websocket.Conn]string, len(a.conns))
+	for c, name := range a.conns {
+		if to == "" || strings.EqualFold(name, to) {
+			targets[c] = name
+		}
+	}
+	a.mu.Unlock()
+	if len(targets) == 0 {
+		return nil, errNotConnected
+	}
+
+	wctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+
+	var sent []string
+	var errs []error
+	for c, name := range targets {
+		if err := c.Write(wctx, websocket.MessageText, []byte(text)); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		sent = append(sent, name)
+	}
+	if len(sent) == 0 {
+		return nil, errors.Join(errs...)
+	}
+	slices.Sort(sent)
+	return sent, nil
+}
+
+// runServer слушает cfg.listenAddr и принимает сколько угодно одновременных
+// соединений — каждое ведёт свою session в своей горутине (её запускает сам
+// net/http на каждый запрос). Останавливается, когда отменят ctx, закрывая
+// HTTP-сервер и все установленные соединения.
+func (a *agent) runServer(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+a.cfg.token)) != 1 {
@@ -546,22 +646,9 @@ func (a *agent) runServer(ctx context.Context) {
 		if peer == "" {
 			peer = r.RemoteAddr
 		}
-		if !sessionMu.TryLock() {
-			log.Printf("agent: отказ %s: уже есть активное соединение", peer)
-			c.Close(websocket.StatusPolicyViolation, "already connected")
-			return
-		}
-		defer sessionMu.Unlock()
-
-		active.Store(c)
-		defer active.CompareAndSwap(c, nil)
-
 		log.Printf("agent: соединение: %s", peer)
 		a.session(ctx, c, peer)
 		log.Printf("agent: соединение закрыто: %s", peer)
-		if ctx.Err() == nil {
-			a.setState(stateWaiting, "")
-		}
 	})
 
 	srv := &http.Server{Addr: a.cfg.listenAddr, Handler: mux}
@@ -575,12 +662,29 @@ func (a *agent) runServer(ctx context.Context) {
 			log.Printf("agent: сервер остановлен с ошибкой: %v", err)
 		}
 	case <-ctx.Done():
+		// http.Server.Shutdown не закрывает хайджекнутые (upgrade'нутые)
+		// соединения сам — закрываем все явно, иначе их session() не
+		// заметит отмену ctx.
+		a.closeAllConns()
 		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(sctx); err != nil {
 			log.Printf("agent: остановка сервера: %v", err)
 		}
 		<-errCh
+	}
+}
+
+// closeAllConns форсирует закрытие всех установленных сейчас соединений.
+func (a *agent) closeAllConns() {
+	a.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(a.conns))
+	for c := range a.conns {
+		conns = append(conns, c)
+	}
+	a.mu.Unlock()
+	for _, c := range conns {
+		c.CloseNow()
 	}
 }
 
@@ -621,7 +725,6 @@ func (a *agent) runClient(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		a.setState(stateWaiting, "")
 		select {
 		case <-time.After(reconnectDelay):
 		case <-ctx.Done():
@@ -633,24 +736,16 @@ func (a *agent) runClient(ctx context.Context) {
 // session обслуживает установленное соединение, пока его не закроет
 // собеседник или не отменят ctx: раз в pingInterval шлёт протокольный ping,
 // чтобы заметить обрыв (например, ноутбук уснул), отвечает на "ping" и
-// складывает остальные входящие сообщения в inbox.
+// складывает остальные входящие сообщения в inbox. Несколько session могут
+// выполняться одновременно (сервер с несколькими подключёнными пирами).
 func (a *agent) session(ctx context.Context, c *websocket.Conn, peer string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer c.CloseNow()
 	c.SetReadLimit(maxMessageSize)
 
-	a.mu.Lock()
-	a.conn = c
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		if a.conn == c {
-			a.conn = nil
-		}
-		a.mu.Unlock()
-	}()
-	a.setState(stateConnected, peer)
+	a.addPeer(c, peer)
+	defer a.removePeer(c)
 
 	go func() {
 		t := time.NewTicker(pingInterval)
@@ -762,9 +857,9 @@ func (b *inbox) wait(ctx context.Context, id int) ([]message, int) {
 // ---------------------------------------------------------------------------
 // Локальный API (только 127.0.0.1) — им пользуется скилл Claude
 //
-//	GET  /status                   состояние соединения
-//	POST /send   (тело — текст)    отправить собеседнику
-//	GET  /inbox?after=N&wait=60    входящие с ID > N; wait — ждать новых
+//	GET  /status                     состояние соединения, список пиров
+//	POST /send?to=имя (тело — текст) отправить; без to — всем подключённым
+//	GET  /inbox?after=N&wait=60      входящие с ID > N; wait — ждать новых
 //
 // Каждый запрос должен нести заголовок X-AI-Talk: 1, а Host — указывать на
 // loopback. Это защита от страниц в браузере: кросс-доменный fetch не может
@@ -784,6 +879,7 @@ func (a *agent) apiHandler() http.Handler {
 			"enabled": a.Running(),
 			"state":   state.String(),
 			"peer":    peer,
+			"peers":   a.PeerNames(),
 			"last_id": last,
 		})
 	})
@@ -802,7 +898,9 @@ func (a *agent) apiHandler() http.Handler {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "соединение выключено в трее ai-talk"})
 			return
 		}
-		if err := a.Send(r.Context(), text); err != nil {
+		to := r.URL.Query().Get("to")
+		sent, err := a.Send(r.Context(), to, text)
+		if err != nil {
 			status := http.StatusBadGateway
 			if errors.Is(err, errNotConnected) {
 				status = http.StatusConflict
@@ -810,9 +908,8 @@ func (a *agent) apiHandler() http.Handler {
 			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
-		_, peer := a.State()
-		log.Printf("api: отправлено %s (%d байт)", peer, len(text))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": peer})
+		log.Printf("api: отправлено %s (%d байт)", strings.Join(sent, ", "), len(text))
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to": sent})
 	})
 	mux.HandleFunc("GET /inbox", func(w http.ResponseWriter, r *http.Request) {
 		after := 0
@@ -1261,6 +1358,8 @@ func main() {
 	tray := &trayApp{debug: cfg.debug}
 	tray.agent = newAgent(cfg, tray.onStateChange)
 	tray.agent.onMessage = tray.onMessage
+	tray.agent.onPeerConnected = tray.onPeerConnected
+	tray.agent.onPeerDisconnected = tray.onPeerDisconnected
 	go func() {
 		if err := serveAPI(cfg.apiAddr, tray.agent.apiHandler()); err != nil {
 			log.Printf("api: %v — скилл Claude работать не будет", err)
@@ -1371,8 +1470,18 @@ func (a *trayApp) onStateChange(s connState, peer string) {
 	case stateConnected:
 		systray.SetIcon(iconConnected)
 		systray.SetTooltip("AI Talk: подключено к " + peer)
-		showNotification("AI Talk", "Подключено: "+peer, false)
 	}
+}
+
+// onPeerConnected показывает уведомление о подключении конкретного
+// собеседника — отдельно от onStateChange, чтобы не пропустить второго и
+// последующих пиров, когда кто-то уже был подключён.
+func (a *trayApp) onPeerConnected(peer string) {
+	showNotification("AI Talk", "Подключено: "+peer, false)
+}
+
+func (a *trayApp) onPeerDisconnected(peer string) {
+	log.Printf("tray: отключился %s", peer)
 }
 
 // addShowMessagesItem добавляет пункт с галочкой, включающий/выключающий
