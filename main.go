@@ -33,6 +33,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -292,8 +293,8 @@ type config struct {
 
 // resolveConfig собирает настройки по приоритету: флаги, затем окружение (к
 // этому моменту в нём уже и значения из .env). Пустой флаг означает «не
-// задан». Если заданы и AGENT_LISTEN, и AGENT_CONNECT, побеждает режим
-// сервера.
+// задан». Если заданы и AGENT_LISTEN, и AGENT_CONNECT, работают оба сразу
+// (режим "both" — см. Start и shouldDial).
 func resolveConfig(debug bool, listenFlag, connectFlag, tokenFlag string) config {
 	cfg := config{debug: debug}
 	cfg.listenAddr = os.Getenv("AGENT_LISTEN")
@@ -316,8 +317,7 @@ func resolveConfig(debug bool, listenFlag, connectFlag, tokenFlag string) config
 
 	switch {
 	case cfg.listenAddr != "" && cfg.connectURL != "":
-		log.Printf("config: заданы и AGENT_LISTEN, и AGENT_CONNECT — используется режим сервера")
-		cfg.mode = "server"
+		cfg.mode = "both"
 	case cfg.listenAddr != "":
 		cfg.mode = "server"
 	case cfg.connectURL != "":
@@ -392,9 +392,10 @@ var errNotConnected = errors.New("собеседник не подключён")
 //
 // Протокол — как у lanagent: WebSocket, токен в Authorization, имя компьютера
 // в X-Agent-Host, текстовые кадры; на "ping" сторона сама отвечает
-// "pong от <имя>". Start запускает сервер (accept) или клиент (dial с
-// повторами) по cfg.mode, Stop останавливает. Входящие сообщения
-// складываются в inbox, откуда их забирает локальный API (apiHandler).
+// "pong от <имя>". Start запускает сервер (accept), клиент (dial с
+// повторами) или оба сразу, смотря что задано в cfg, Stop останавливает.
+// Входящие сообщения складываются в inbox, откуда их забирает локальный API
+// (apiHandler).
 // ---------------------------------------------------------------------------
 
 type agent struct {
@@ -437,8 +438,10 @@ func (a *agent) State() (connState, string) {
 	return a.state, a.peer
 }
 
-// Start запускает сервер или клиент согласно cfg.mode. Повторный вызов,
-// пока соединение уже запущено, ничего не делает.
+// Start запускает сервер (если задан AGENT_LISTEN) и клиент (если задан
+// AGENT_CONNECT) — при "both" оба сразу, параллельно, деля один agent (общие
+// inbox и conns). Повторный вызов, пока соединение уже запущено, ничего не
+// делает.
 func (a *agent) Start() error {
 	if !a.cfg.configured() {
 		return errors.New("не настроено: задайте AGENT_LISTEN или AGENT_CONNECT, и AGENT_TOKEN")
@@ -456,16 +459,26 @@ func (a *agent) Start() error {
 	a.mu.Unlock()
 
 	a.setState(stateWaiting, "")
-	go func() {
-		defer close(done)
-		switch a.cfg.mode {
-		case "server":
+	var wg sync.WaitGroup
+	if a.cfg.listenAddr != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			a.runServer(ctx)
-		case "client":
+		}()
+	}
+	if a.cfg.connectURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			a.runClient(ctx)
-		}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(done)
 		if ctx.Err() == nil {
-			// Завершилось само (например, порт занят), а не через Stop().
+			// Обе половины завершились сами (например, порт занят), а не через Stop().
 			a.mu.Lock()
 			a.cancel = nil
 			a.done = nil
@@ -688,9 +701,37 @@ func (a *agent) closeAllConns() {
 	}
 }
 
+// shouldDial решает, набирать ли myHost номер собеседника connectURL, или
+// ждать, пока он наберёт нас сам — нужно только в режиме "both" (когда оба
+// Windows-компьютера одновременно и слушают, и пытаются дозвониться друг до
+// друга), чтобы между той же парой не возникало сразу двух WebSocket-связей.
+// Решение детерминированное и не требует согласования: набирает тот, чьё
+// имя меньше по алфавиту. Если connectURL не разобрать или в нём нет имени
+// хоста — ведёт себя как раньше, пробует дозвониться.
+func shouldDial(myHost, connectURL string) bool {
+	u, err := url.Parse(connectURL)
+	if err != nil {
+		return true
+	}
+	target := u.Hostname()
+	if target == "" {
+		return true
+	}
+	return strings.ToLower(myHost) < strings.ToLower(target)
+}
+
 // runClient подключается к cfg.connectURL и переподключается при обрыве,
-// пока не отменят ctx.
+// пока не отменят ctx. shouldDial решает исход только в режиме "both" (когда
+// мы и так уже слушаем cfg.listenAddr) — если набирать должен не он, просто
+// ждёт отмены ctx, не пытаясь дозвониться: соединение установит встречная
+// сторона, набрав номер нашего сервера. В чистом клиентском режиме (без
+// AGENT_LISTEN) набирать больше некому — дозванивается всегда.
 func (a *agent) runClient(ctx context.Context) {
+	if a.cfg.listenAddr != "" && !shouldDial(host, a.cfg.connectURL) {
+		log.Printf("agent: не набираю %s — моё имя %q не меньше по алфавиту, жду встречного подключения", a.cfg.connectURL, host)
+		<-ctx.Done()
+		return
+	}
 	for {
 		if ctx.Err() != nil {
 			return
@@ -1530,10 +1571,14 @@ func (a *trayApp) statusLabel(s connState, peer string) string {
 	case stateConnected:
 		return "Статус: подключено к " + peer
 	case stateWaiting:
-		if a.agent.cfg.mode == "server" {
+		switch a.agent.cfg.mode {
+		case "server":
 			return "Статус: ожидание подключения на " + a.agent.cfg.listenAddr
+		case "both":
+			return fmt.Sprintf("Статус: слушаю %s, набираю %s", a.agent.cfg.listenAddr, a.agent.cfg.connectURL)
+		default:
+			return "Статус: подключение к " + a.agent.cfg.connectURL
 		}
-		return "Статус: подключение к " + a.agent.cfg.connectURL
 	default:
 		return "Статус: отключено"
 	}

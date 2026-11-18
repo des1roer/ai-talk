@@ -67,9 +67,9 @@ func TestResolveConfig(t *testing.T) {
 			wantListen: ":9090",
 		},
 		{
-			name:        "заданы оба — побеждает сервер",
+			name:        "заданы оба — работают оба",
 			env:         map[string]string{"AGENT_LISTEN": ":8080", "AGENT_CONNECT": "ws://host:8080/ws"},
-			wantMode:    "server",
+			wantMode:    "both",
 			wantListen:  ":8080",
 			wantConnect: "ws://host:8080/ws",
 		},
@@ -281,6 +281,11 @@ func TestStatusLabel(t *testing.T) {
 	clientApp := &trayApp{agent: &agent{cfg: config{mode: "client", connectURL: "ws://host/ws"}}}
 	if got := clientApp.statusLabel(stateWaiting, ""); got != "Статус: подключение к ws://host/ws" {
 		t.Errorf("client waiting: %q", got)
+	}
+
+	bothApp := &trayApp{agent: &agent{cfg: config{mode: "both", listenAddr: ":8080", connectURL: "ws://host/ws"}}}
+	if got := bothApp.statusLabel(stateWaiting, ""); got != "Статус: слушаю :8080, набираю ws://host/ws" {
+		t.Errorf("both waiting: %q", got)
 	}
 }
 
@@ -496,6 +501,87 @@ func TestAgentServerAcceptsMultiplePeers(t *testing.T) {
 	}
 	if s, _ := a.State(); s != stateConnected {
 		t.Errorf("State() после отключения одного из двух = %v, want stateConnected", s)
+	}
+}
+
+func TestShouldDial(t *testing.T) {
+	tests := []struct {
+		myHost, connectURL string
+		want               bool
+	}{
+		{"aaa", "ws://zzz:8080/ws", true},
+		{"zzz", "ws://aaa:8080/ws", false},
+		{"Aaa", "ws://zzz:8080/ws", true},  // без учёта регистра
+		{"aaa", "ws://aaa:8080/ws", false}, // равные имена — не набираем оба
+		{"aaa", "://не-url", true},         // не разобрали — ведём себя как раньше
+		{"aaa", "ws:///ws", true},          // нет имени хоста
+	}
+	for _, tt := range tests {
+		if got := shouldDial(tt.myHost, tt.connectURL); got != tt.want {
+			t.Errorf("shouldDial(%q, %q) = %v, want %v", tt.myHost, tt.connectURL, got, tt.want)
+		}
+	}
+}
+
+// TestAgentBothModeRunsServerAndClient проверяет режим "both": один agent
+// одновременно слушает и дозванивается. host — один общий глобальный var
+// для всего тестового процесса, поэтому обе стороны этого теста неизбежно
+// называют себя одинаково ("aaa-local") — сравнивается только то, что обе
+// половины вообще работают, а не точные имена пиров друг у друга.
+func TestAgentBothModeRunsServerAndClient(t *testing.T) {
+	setVar(t, &host, "aaa-local")
+
+	remoteAddr := freeAddr(t)
+	remote := newAgent(config{mode: "server", listenAddr: remoteAddr, token: "secret"}, nil)
+	if err := remote.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(remote.Stop)
+	waitForState(t, remote, stateWaiting)
+
+	_, port, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localAddr := freeAddr(t)
+	local := newAgent(config{
+		mode:       "both",
+		listenAddr: localAddr,
+		connectURL: "ws://localhost:" + port + "/ws", // "aaa-local" < "localhost" — дозваниваемся
+		token:      "secret",
+	}, nil)
+	if err := local.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Stop)
+
+	// Клиентская половина local дозвонилась до remote.
+	waitForState(t, remote, stateConnected)
+	if names := remote.PeerNames(); !slices.Equal(names, []string{"aaa-local"}) {
+		t.Fatalf("remote.PeerNames() = %v, want [aaa-local]", names)
+	}
+
+	// Серверная половина local тоже принимает входящие — проверяем третьим клиентом.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws://"+localAddr+"/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer secret"}, "X-Agent-Host": {"THIRD"}},
+	})
+	if err != nil {
+		t.Fatalf("Dial в серверную половину local: %v", err)
+	}
+	defer c.CloseNow()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if names := local.PeerNames(); slices.Equal(names, []string{"THIRD", "aaa-local"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("local.PeerNames() = %v, want [THIRD aaa-local]", local.PeerNames())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
