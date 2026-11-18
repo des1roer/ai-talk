@@ -504,22 +504,72 @@ func TestAgentServerAcceptsMultiplePeers(t *testing.T) {
 	}
 }
 
-func TestShouldDial(t *testing.T) {
-	tests := []struct {
-		myHost, connectURL string
-		want               bool
-	}{
-		{"aaa", "ws://zzz:8080/ws", true},
-		{"zzz", "ws://aaa:8080/ws", false},
-		{"Aaa", "ws://zzz:8080/ws", true},  // без учёта регистра
-		{"aaa", "ws://aaa:8080/ws", false}, // равные имена — не набираем оба
-		{"aaa", "://не-url", true},         // не разобрали — ведём себя как раньше
-		{"aaa", "ws:///ws", true},          // нет имени хоста
-	}
-	for _, tt := range tests {
-		if got := shouldDial(tt.myHost, tt.connectURL); got != tt.want {
-			t.Errorf("shouldDial(%q, %q) = %v, want %v", tt.myHost, tt.connectURL, got, tt.want)
+// TestAgentAddPeerDeduplicatesByName проверяет дедупликацию в addPeer: если
+// одно и то же имя пришло по двум соединениям сразу (режим "both" на обеих
+// сторонах симметричной пары — звонят друг другу одновременно), остаётся
+// только одно, набранное участником с именем меньшим по алфавиту. Сравнение
+// идёт по именам из X-Agent-Host, поэтому неважно, IP или хостнейм был в
+// AGENT_CONNECT — вызываем addPeer напрямую, минуя набор/приём, с
+// настоящими websocket.Conn (нужны для настоящего Close/Read).
+func TestAgentAddPeerDeduplicatesByName(t *testing.T) {
+	setVar(t, &host, "bbb-self")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
 		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer srv.Close()
+	wsURL := "ws://" + strings.TrimPrefix(srv.URL, "http://") + "/ws"
+
+	dial := func() *websocket.Conn {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		return c
+	}
+
+	a := newAgent(config{}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// "bbb-self" < "ccc-peer" — дозваниваемся мы; должно остаться dialed=true.
+	dialedConn := dial()
+	defer dialedConn.CloseNow()
+	a.addPeer(dialedConn, "ccc-peer", true)
+
+	acceptedConn := dial()
+	defer acceptedConn.CloseNow()
+	a.addPeer(acceptedConn, "ccc-peer", false)
+
+	if names := a.PeerNames(); !slices.Equal(names, []string{"ccc-peer"}) {
+		t.Fatalf("PeerNames() = %v, want ровно [ccc-peer], не дубль", names)
+	}
+	if _, _, err := acceptedConn.Read(ctx); err == nil {
+		t.Error("дублирующее принятое соединение (ccc-peer) не было закрыто")
+	}
+
+	// "bbb-self" > "aaa-peer" — набирает собеседник; должно остаться dialed=false.
+	dialedConn2 := dial()
+	defer dialedConn2.CloseNow()
+	a.addPeer(dialedConn2, "aaa-peer", true)
+
+	acceptedConn2 := dial()
+	defer acceptedConn2.CloseNow()
+	a.addPeer(acceptedConn2, "aaa-peer", false)
+
+	if names := a.PeerNames(); !slices.Equal(names, []string{"aaa-peer", "ccc-peer"}) {
+		t.Fatalf("PeerNames() = %v, want [aaa-peer ccc-peer]", names)
+	}
+	if _, _, err := dialedConn2.Read(ctx); err == nil {
+		t.Error("дублирующее набранное нами соединение (aaa-peer) не было закрыто")
 	}
 }
 

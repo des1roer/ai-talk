@@ -57,7 +57,7 @@ go test ./...
 | —          | `AGENT_API_PORT`| Порт локального API на 127.0.0.1, по умолчанию `8767`            |
 | `-debug`   | —               | Показывать консоль с логами отладки                              |
 
-Если заданы и `AGENT_LISTEN`, и `AGENT_CONNECT`, работают оба сразу. Если оба компьютера в паре настроены так (оба слушают и оба пытаются дозвониться друг до друга — симметричная конфигурация для отказоустойчивости: неважно, какой из двух сейчас включён), между ними не возникнет двух параллельных соединений: дозванивается тот, чьё имя компьютера меньше по алфавиту, второй просто ждёт входящего. Телефон/планшет при этом остаётся чистым клиентом (`AGENT_CONNECT` без `AGENT_LISTEN`) — ему это правило не касается.
+Если заданы и `AGENT_LISTEN`, и `AGENT_CONNECT`, работают оба сразу. Если оба компьютера в паре настроены так (оба слушают и оба пытаются дозвониться друг до друга — симметричная конфигурация для отказоустойчивости: неважно, какой из двух сейчас включён), дозваниваются оба, но лишнее из двух получившихся соединений само закрывается: остаётся то, что набрал компьютер с именем, меньшим по алфавиту. Телефон/планшет при этом остаётся чистым клиентом (`AGENT_CONNECT` без `AGENT_LISTEN`) — ему это правило не касается.
 
 Токен, если не задан флагом/переменной/`.env`, ищется в файле `ai-talk.token` рядом с exe или в `%LOCALAPPDATA%\ai-talk\ai-talk.token` (одна строка с секретом).
 
@@ -83,7 +83,7 @@ AGENT_TOKEN=supersecret
 
 **Объекты:**
 
-- `agent` — включение/выключение соединений: `Start`/`Stop` запускают/останавливают `runServer` (accept, сколько угодно одновременных подключений), если задан `AGENT_LISTEN`, и/или `runClient` (dial с повторами), если задан `AGENT_CONNECT`, — при обоих сразу (`cfg.mode == "both"`) работают оба параллельно, `shouldDial` решает, кто из двух одинаково настроенных Windows-компьютеров дозванивается, а кто просто ждёт входящего (не меньше по алфавиту); `session` обслуживает одно установленное соединение (периодический ping, ответ на `ping`, входящие — в `inbox`) — их может быть несколько параллельно; `conns` хранит все текущие (conn → имя), `addPeer`/`removePeer` пересчитывают агрегатное состояние; `Send` пишет одному собеседнику по имени (`to`) или рассылает всем;
+- `agent` — включение/выключение соединений: `Start`/`Stop` запускают/останавливают `runServer` (accept, сколько угодно одновременных подключений), если задан `AGENT_LISTEN`, и/или `runClient` (dial с повторами), если задан `AGENT_CONNECT`, — при обоих сразу (`cfg.mode == "both"`) работают оба параллельно; `session` обслуживает одно установленное соединение (периодический ping, ответ на `ping`, входящие — в `inbox`) — их может быть несколько параллельно; `conns` хранит все текущие (conn → кто это и кем набран), `addPeer`/`removePeer` пересчитывают агрегатное состояние — если от того же имени пришло сразу два соединения (оба компьютера симметричной пары одновременно дозвонились друг до друга), `addPeer` оставляет то, что набрал участник с именем, меньшим по алфавиту, второе закрывает; `Send` пишет одному собеседнику по имени (`to`) или рассылает всем;
 - `inbox` — последние входящие с возрастающими ID и ожиданием новых (`wait`); `apiHandler`/`serveAPI` — локальный API для скилла;
 - `trayApp` — связывает меню трея (`onReady`/`onExit`) с `agent` через колбэк `onStateChange`, который обновляет значок/подсказку/пункт статуса и показывает уведомление при подключении;
 - `config` — итоговые настройки (`resolveConfig`: флаги > окружение/`.env` > умолчания), `autostart` — автозапуск через `HKCU\...\Run`.
@@ -137,7 +137,7 @@ Each computer is configured separately: `AGENT_LISTEN` listens for connections, 
 | —          | `AGENT_API_PORT`| Local API port on 127.0.0.1, default `8767`                |
 | `-debug`   | —               | Show a console with debug logs                             |
 
-If both `AGENT_LISTEN` and `AGENT_CONNECT` are set, both run. If the two computers in a pair are both set up this way (both listening and both trying to dial each other — a symmetric setup for resilience: either one can be the one that's on), they won't end up with two parallel connections: the one whose hostname sorts first alphabetically dials out, the other just waits to accept. A phone/tablet stays a plain client (`AGENT_CONNECT` without `AGENT_LISTEN`) and isn't affected by this rule.
+If both `AGENT_LISTEN` and `AGENT_CONNECT` are set, both run. If the two computers in a pair are both set up this way (both listening and both trying to dial each other — a symmetric setup for resilience: either one can be the one that's on), both dial out, but the redundant one of the two resulting connections closes itself: the one whose hostname sorts first alphabetically wins. A phone/tablet stays a plain client (`AGENT_CONNECT` without `AGENT_LISTEN`) and isn't affected by this rule.
 
 ## License
 
