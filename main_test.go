@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -570,6 +571,57 @@ func TestAgentAddPeerDeduplicatesByName(t *testing.T) {
 	}
 	if _, _, err := dialedConn2.Read(ctx); err == nil {
 		t.Error("дублирующее набранное нами соединение (aaa-peer) не было закрыто")
+	}
+}
+
+// TestAgentClientWaitsInsteadOfRedialingAfterDedup проверяет исправление
+// перезвона: если наш набор проиграл дедупликацию в addPeer (связь с тем же
+// именем уже держится через встречное соединение), runClient не должен
+// сразу пытаться дозвониться снова — иначе каждый повтор снова станет
+// дублем и снова закроется, раз в reconnectDelay, бесконечно.
+func TestAgentClientWaitsInsteadOfRedialingAfterDedup(t *testing.T) {
+	setVar(t, &host, "zzz-self") // "zzz-self" > "aaa-remote" — наш набор проигрывает
+
+	fakeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer fakeSrv.Close()
+	fakeConn, _, err := websocket.Dial(context.Background(), "ws://"+strings.TrimPrefix(fakeSrv.URL, "http://")+"/ws", nil)
+	if err != nil {
+		t.Fatalf("Dial fakeConn: %v", err)
+	}
+	defer fakeConn.CloseNow()
+
+	var dialCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialCount.Add(1)
+		w.Header().Set("X-Agent-Host", "aaa-remote")
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-r.Context().Done()
+		c.CloseNow()
+	}))
+	defer srv.Close()
+	wsURL := "ws://" + strings.TrimPrefix(srv.URL, "http://") + "/ws"
+
+	a := newAgent(config{mode: "client", connectURL: wsURL, token: "secret"}, nil)
+	a.addPeer(fakeConn, "aaa-remote", false) // уже подключённый "встречный звонок"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.runClient(ctx)
+
+	time.Sleep(2500 * time.Millisecond)
+
+	if n := dialCount.Load(); n != 1 {
+		t.Errorf("dialCount = %d за 2.5 с, want 1 — после проигрыша дедупликации runClient не должен долбить повторным набором, пока связь с тем же именем ещё жива", n)
 	}
 }
 

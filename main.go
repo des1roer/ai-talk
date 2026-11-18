@@ -565,6 +565,13 @@ func (a *agent) forceOff() {
 // URL — поэтому дедупликация работает и когда AGENT_CONNECT указывает IP, в
 // отличие от решения по URL до набора); лишнее закрывает. Пересчитывает
 // агрегатное состояние/список имён и уведомляет onState/onPeerConnected.
+//
+// Вырожденный случай: если имя собеседника совпадает с нашим host (две
+// машины с одинаковым именем компьютера — в домашней сети маловероятно, но
+// возможно при ошибке конфигурации), сравнение не даёт решения, и обе
+// стороны симметрично могут закрыть не ту половину — тогда не выживет ни
+// одно из двух соединений. Не стали чинить отдельно: тривиально избегается
+// уникальными именами компьютеров, которые и так нужны для X-Agent-Host.
 func (a *agent) addPeer(c *websocket.Conn, name string, dialed bool) {
 	a.mu.Lock()
 	if a.conns == nil {
@@ -670,6 +677,19 @@ func (a *agent) PeerNames() []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// hasPeer сообщает, подключён ли сейчас собеседник с именем name (без учёта
+// регистра), независимо от того, через какое соединение.
+func (a *agent) hasPeer(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, info := range a.conns {
+		if strings.EqualFold(info.name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // Send отправляет text собеседникам по установленным соединениям: если to не
@@ -781,9 +801,24 @@ func (a *agent) closeAllConns() {
 // (см. его комментарий); здесь набор ничем не отличается от обычного
 // клиентского режима.
 func (a *agent) runClient(ctx context.Context) {
+	var knownPeer string // имя собеседника из прошлого успешного набора
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Если нас только что закрыл addPeer как дубль (в режиме "both" оба
+		// одновременно дозвонились друг до друга), связь с тем же именем уже
+		// держится через встречное соединение — незачем долбить повторным
+		// набором раз в reconnectDelay, он снова станет дублем и снова
+		// закроется. Ждём, пока оно пропадёт, и только тогда набираем опять.
+		if knownPeer != "" && a.hasPeer(knownPeer) {
+			select {
+			case <-time.After(dialRetryDelay):
+			case <-ctx.Done():
+				return
+			}
+			continue
 		}
 
 		dctx, cancel := context.WithTimeout(ctx, dialTimeout)
@@ -809,6 +844,7 @@ func (a *agent) runClient(ctx context.Context) {
 		if peer == "" {
 			peer = a.cfg.connectURL
 		}
+		knownPeer = peer
 		log.Printf("agent: подключено к %s (%s)", a.cfg.connectURL, peer)
 		a.session(ctx, c, peer, true)
 		log.Printf("agent: соединение потеряно")
