@@ -5,4 +5,5 @@ data class ChatMessage(
     val fromSelf: Boolean,
     val text: String,
     val timestamp: Long,
+    val failed: Boolean = false,
 )

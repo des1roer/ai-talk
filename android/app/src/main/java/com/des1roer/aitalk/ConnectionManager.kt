@@ -57,11 +57,21 @@ class ConnectionManager(private val settings: SettingsStore) {
     }
 
     fun send(text: String): Boolean {
+        val ok = trySend(text)
+        appendMessage(fromSelf = true, text = text, failed = !ok)
+        return ok
+    }
+
+    fun retry(id: Long) {
+        val message = _messages.value.find { it.id == id } ?: return
+        val ok = trySend(message.text)
+        _messages.value = _messages.value.map { if (it.id == id) it.copy(failed = !ok) else it }
+    }
+
+    private fun trySend(text: String): Boolean {
         val socket = webSocket ?: return false
         if (_state.value !is ConnectionState.Connected) return false
-        if (!socket.send(text)) return false
-        appendMessage(fromSelf = true, text = text)
-        return true
+        return socket.send(text)
     }
 
     private suspend fun reconnectLoop() {
@@ -106,8 +116,14 @@ class ConnectionManager(private val settings: SettingsStore) {
         _state.value = ConnectionState.Off
     }
 
-    private fun appendMessage(fromSelf: Boolean, text: String) {
-        val message = ChatMessage(id = nextId++, fromSelf = fromSelf, text = text, timestamp = System.currentTimeMillis())
+    private fun appendMessage(fromSelf: Boolean, text: String, failed: Boolean = false) {
+        val message = ChatMessage(
+            id = nextId++,
+            fromSelf = fromSelf,
+            text = text,
+            timestamp = System.currentTimeMillis(),
+            failed = failed,
+        )
         _messages.value = _messages.value + message
     }
 }
